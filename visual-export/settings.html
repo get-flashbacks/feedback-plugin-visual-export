@@ -1,21 +1,21 @@
 <!--
   SPDX-License-Identifier: AGPL-3.0-or-later
-  Settings panel for my-plugin.
+  Settings panel for visual-export.
 
   The Host renders this markup in the plugin's settings panel, grouped under the
   settings.category ("custom" in this case). Keep all styles and scripts scoped to
-  this panel using class prefixes based on the plugin id (my-plugin-settings).
+  this panel using class prefixes based on the plugin id (visual-export-settings).
 
   Settings values should be persisted through the plugin's own routes
-  (/api/plugins/my-plugin/settings), not by writing files directly from the client.
+  (/api/plugins/visual-export/settings), not by writing files directly from the client.
 -->
-<div class="my-plugin-settings">
+<div class="visual-export-settings">
   <fieldset>
     <legend>Appearance</legend>
 
     <label>
       Color
-      <select data-setting="color" class="my-plugin-settings__color-select">
+      <select data-setting="color" class="visual-export-settings__color-select">
         <option value="indigo">Indigo</option>
         <option value="crimson">Crimson</option>
         <option value="emerald">Emerald</option>
@@ -32,7 +32,7 @@
         step="1"
         value="5"
         data-setting="intensity"
-        class="my-plugin-settings__intensity-slider"
+        class="visual-export-settings__intensity-slider"
       />
       <span data-role="intensity-value">5</span>
     </label>
@@ -45,14 +45,14 @@
       <input
         type="checkbox"
         data-setting="enable_animations"
-        class="my-plugin-settings__enable-animations"
+        class="visual-export-settings__enable-animations"
       />
       Enable animations
     </label>
   </fieldset>
 
   <button
-    class="my-plugin-settings__save-button"
+    class="visual-export-settings__save-button"
     data-role="save-settings"
   >
     Save Settings
@@ -63,8 +63,8 @@
   // Simple settings persistence example.
   // In production, this would be more robust and handle loading saved values.
   (function () {
-    const PLUGIN_ID = "my-plugin";
-    const settingsPanel = document.querySelector(".my-plugin-settings");
+    const PLUGIN_ID = "visual-export";
+    const settingsPanel = document.querySelector(".visual-export-settings");
 
     if (!settingsPanel) return;
 

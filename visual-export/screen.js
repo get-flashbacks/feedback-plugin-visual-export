@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Client screen for my-plugin.
+// Client screen for visual-export.
 //
 // This script runs on the main thread when the plugin's screen is active.
-// The Host creates a container element (id="plugin-my-plugin") and sets its
+// The Host creates a container element (id="plugin-visual-export") and sets its
 // markup from screen.html. This script finds its own DOM by ID and wires up
 // behavior. Keep all DOM and CSS scoped to the plugin's root (data-plugin-id)
 // so nothing leaks into the rest of the app (spec §6.3, §6.4).
 
-const PLUGIN_ID = "my-plugin";
+const PLUGIN_ID = "visual-export";
 
 // Guard against re-hydration: run setup only once.
 if (!window[`__${PLUGIN_ID}_setup`]) {
@@ -42,7 +42,7 @@ function setupScreen(root) {
 
 async function loadSettings(root) {
   // Fetch the plugin's persisted settings from the server.
-  // This assumes routes.py defines a GET /api/plugins/my-plugin/settings endpoint.
+  // This assumes routes.py defines a GET /api/plugins/visual-export/settings endpoint.
   try {
     const res = await fetch(`/api/plugins/${PLUGIN_ID}/settings`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);

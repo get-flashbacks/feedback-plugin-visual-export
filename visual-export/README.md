@@ -1,4 +1,4 @@
-# my-plugin
+# visual-export
 
 A feedBack plugin template with all common surfaces: client screen, settings panel, and server routes.
 
@@ -23,7 +23,7 @@ The plugin persists user settings through its server routes and applies them on 
 
 Before anything else, choose a unique `id` for your plugin. The folder name **must exactly match** the manifest `id`. This is the most common discovery failure.
 
-- **Rename** the `my-plugin/` folder to your chosen name (e.g., `tuner`, `drum-highway-3d`).
+- **Rename** the `visual-export/` folder to your chosen name (e.g., `tuner`, `drum-highway-3d`).
 - **Update** `plugin.json` to set `"id": "<your-new-id>"` to match the folder name.
 - Use **lowercase alphanumeric with `-` or `_` separators** (e.g., `^[a-z0-9][a-z0-9_-]*$`).
 
@@ -85,7 +85,7 @@ Update `routes.py` to handle any server-side logic:
 
 Customize `assets/plugin.css` for your plugin's visual appearance. Remember:
 
-- **Scope all selectors** to your plugin's classes (`.my-plugin`, `.my-plugin-settings`) so styles don't leak.
+- **Scope all selectors** to your plugin's classes (`.visual-export`, `.visual-export-settings`) so styles don't leak.
 - **Don't mutate the app shell.** Use the Host's contribution registries to add to shared surfaces (spec §6.3).
 - The Host applies these styles only while your screen is active, then unloads them.
 

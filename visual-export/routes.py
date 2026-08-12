@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Server routes for my-plugin.
+"""Server routes for visual-export.
 
 Demonstrates spec §7 best practices:
   * all work happens inside setup() — nothing at import time;
@@ -16,7 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-PLUGIN_ID = "my-plugin"
+PLUGIN_ID = "visual-export"
 MAX_SETTINGS_BODY_BYTES = 16 * 1024
 _DEFAULTS = {
     "color": "indigo",
@@ -38,7 +38,7 @@ def _is_valid_setting(name: str, value: object) -> bool:
 
 
 def setup(app: FastAPI, context: dict) -> None:
-    """Register routes for my-plugin.
+    """Register routes for visual-export.
 
     Args:
         app: FastAPI application instance

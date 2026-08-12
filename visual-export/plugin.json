@@ -1,9 +1,9 @@
 {
-  "id": "my-plugin",
-  "name": "My Plugin",
+  "id": "visual-export",
+  "name": "Visual Export",
   "version": "0.1.0",
-  "description": "A feedBack plugin template with screen, settings, and server routes.",
-  "type": "visualization",
+  "description": "Renders the current player layout to a video file for the entire song, without a live performance.",
+  "type": "tools",
   "script": "screen.js",
   "scriptType": "classic",
   "styles": "assets/plugin.css",
@@ -12,6 +12,6 @@
     "category": "custom"
   },
   "routes": "routes.py",
-  "icon": "🎨",
+  "icon": "🎬",
   "minHost": "1.0.0"
 }
