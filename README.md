@@ -1,157 +1,56 @@
-# feedBack Plugin Template
+# Visual Export for fee[dB]ack
 
-A reference template for creating [feedBack plugins](https://github.com/got-feedBack/feedback-plugin-spec).
+Visual Export creates an MP4 of the song currently configured in the fee[dB]ack
+player without having to play and screen-record it in real time. It exports the
+normal player or the active Splitscreen arrangement, so a separate video can be
+made for each guitar, bass, keys, and lyrics layout.
 
-## ⚠️ DISCLAIMER AND WARRANTY
+## Export a video
 
-**This template is provided "AS-IS" without any warranty of any kind, express or implied.** No warranty is given that this template is correct, complete, safe, or fit for any particular purpose.
+1. Load a song and arrange the player exactly as it should appear: highway,
+   camera, overlays, lyrics, and (if used) Splitscreen panels.
+2. In the player **Plugins** rail, select **Export video**.
+3. Choose the output resolution, frame rate, and bitrate, then select
+   **Render MP4**.
 
-**You MUST read and follow the official [Plugin Specification](https://github.com/get-flashbacks/feedback-plugin-spec/blob/main/spec/plugin-spec-v1.md) before creating a plugin.** This template is an example that demonstrates some common patterns, but:
+The player is paused while the exporter renders timestamps directly and its
+previous position is restored afterwards. The generated MP4 downloads when
+FFmpeg has finished muxing its video and audio.
 
-- The specification is the authoritative reference. This template may not cover all requirements.
-- You are responsible for ensuring your plugin complies with the specification.
-- Compliance with this template does not guarantee compliance with the specification.
-- If this template conflicts with the specification, the specification takes precedence.
+Player controls are deliberately excluded from the export. Ambient particles
+and other wall-clock visual effects are not synchronized as part of the
+deterministic render pass.
 
-**Liability:** The authors, contributors, and distributors of this template disclaim all liability for any damages, losses, or consequences arising from the use or inability to use this template, including but not limited to data loss, system failures, security vulnerabilities, or any other issues related to plugin development or deployment.
+## How it works
 
-**Read the spec. This is your responsibility.**
+The browser asks each highway to draw an explicit song time, composites the
+visible player canvases and supported overlays, and encodes H.264 frames using
+WebCodecs. The plugin server uses FFmpeg to mux those frames with the original
+browser-routed song audio as AAC in a fast-start MP4.
 
-## Quick start
+The browser caches the static portion of the scene once per export; per-frame
+work is limited to highway canvases and dynamic text/lyrics. Export speed is
+therefore independent of the song's playback duration, but still depends on
+visualization cost, resolution, and hardware encoding performance.
 
-1. **Copy the template:** Duplicate the `my-plugin/` directory and rename it to your plugin's `id`.
-   ```bash
-   cp -r my-plugin your-plugin
-   ```
+## Host integration
 
-2. **Update the manifest:** Edit `your-plugin/plugin.json`:
-   - Change `"id"` to match your folder name (e.g., `"your-plugin"`)
-   - Update `name`, `version`, `description`, `type`, `icon`
+The exporter relies on the following host interfaces:
 
-3. **Customize the plugin:** Edit the files in your plugin directory:
-   - `screen.js` — Client-side screen logic
-   - `settings.html` — Settings panel markup and behavior
-   - `routes.py` — Server-side logic and persistence
-   - `assets/plugin.css` — Styling
+- A highway renderer with `renderFrameAt(time)` and `getCanvas()`.
+- When exporting a split layout, Splitscreen's `beginOfflineRender()`,
+  `renderFrameAt(time)`, and `endOfflineRender()` bridge.
+- Chromium-family WebCodecs H.264 support and FFmpeg available to the server
+  through `PATH` or the desktop application's bundled `resources/bin` folder.
 
-4. **Drop into feedBack:** Copy your plugin folder into the feedBack plugins directory (default: `~/.config/feedback/plugins/` on Linux, or the platform equivalent).
+## Limits
 
-5. **Reload plugins:** Restart feedBack or use the plugin manager to reload. Your plugin should appear in the plugin list.
+- Audio must be available through the browser's HTML audio source. A mix that
+  exists only in the native/JUCE engine cannot yet be exported.
+- Supported overlays are composited in the browser; advanced third-party
+  CSS/SVG/filter effects may not reproduce pixel-for-pixel.
+- Jumping Tab panes do not provide deterministic frame rendering and are not
+  supported in offline split exports.
 
-## What's included
-
-### `my-plugin/`
-
-A complete, working plugin that demonstrates:
-
-- A **client screen** (`screen.js`) with lifecycle management
-- **Settings persistence** (HTML form + server routes)
-- **Server routes** (`routes.py`) for reading/writing settings
-- **Styling** (`assets/plugin.css`) scoped to the plugin
-- **Documentation** (`README.md`) with common tasks and tips
-
-Each file is heavily commented and shows best practices from the [Plugin Specification](https://github.com/get-flashbacks/feedback-plugin-spec/blob/main/spec/plugin-spec-v1.md).
-
-## Key concepts
-
-### The folder name must match the `id`
-
-This is the most common cause of "why won't my plugin load?" The folder name and manifest `id` must be **exactly identical**, including case.
-
-```
-tuner/                  ✅ Loads as id: "tuner"
-├── plugin.json        →  {"id": "tuner", ...}
-└── ...
-
-Tuner/                  ❌ Will not load (name doesn't match id)
-├── plugin.json        →  {"id": "tuner", ...}
-└── ...
-```
-
-### Settings are server-persisted
-
-Settings are stored server-side in the Host's config directory (usually `~/.config/feedback/plugins/<id>/<id>.json`), not in browser storage. Always fetch/post through your routes:
-
-```javascript
-// Load
-const res = await fetch(`/api/plugins/${PLUGIN_ID}/settings`);
-const settings = await res.json();
-
-// Save
-await fetch(`/api/plugins/${PLUGIN_ID}/settings`, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ key: "value" }),
-});
-```
-
-### Keep everything namespaced
-
-Because all plugins share one document and one `window`, prefix everything with your plugin `id`:
-
-- DOM ids/classes: `.my-plugin`, `#plugin-my-plugin`
-- `window` globals: `window.my_plugin_state`
-- `localStorage` keys: `my_plugin_config`
-- Route paths: `/api/plugins/my_plugin/...`
-
-Namespace collisions silently clobber each other, so be explicit.
-
-### The script must be idempotent
-
-The Host may execute your `screen.js` more than once (e.g., during plugin reloads). Guard against duplicate listeners:
-
-```javascript
-if (!window.__my_plugin_setup) {
-  window.__my_plugin_setup = true;
-  // Set up listeners, timers, observers — only once
-}
-```
-
-See the template's `screen.js` for the pattern.
-
-## Further reading
-
-- **[Plugin Specification](https://github.com/get-flashbacks/feedback-plugin-spec/blob/main/spec/plugin-spec-v1.md)** — The normative contract. Start here if something doesn't work.
-- **[Best Practices Guide](https://github.com/get-flashbacks/feedback-plugin-spec/blob/main/spec/best-practices.md)** — Non-normative advice on building good plugins.
-- **[Full Example Plugin](https://github.com/get-flashbacks/feedback-plugin-spec/tree/main/examples/full-plugin)** — Another worked example in the spec repo.
-
-## Troubleshooting
-
-### Plugin doesn't load
-
-1. Check the folder name matches the manifest `id` (case-sensitive).
-2. Run the reference validator: `python tools/validate.py <plugin-folder>` (if cloned from the spec repo).
-3. Check the Host's logs for import errors in `routes.py` or `script` parsing errors.
-
-### Settings don't persist
-
-1. Check browser DevTools Network tab for errors on POST to `/api/plugins/<id>/settings`.
-2. Verify the Host can write to its config directory.
-3. Check the Host's logs for route errors in your `routes.py`.
-
-### Styles not applied
-
-1. Verify the manifest `styles` key points to the correct CSS file.
-2. Check that selectors are scoped to your plugin's class (not `.screen` or global).
-3. DevTools may show the Host's styles overriding yours — use higher specificity if needed.
-
-## License
-
-This template and all example code are licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later). See the `LICENSE` file for full details.
-
-### About Your Plugin's License
-
-When you create a plugin from this template:
-
-- **You own your plugin.** You are free to choose any license for your plugin code. The template is provided under AGPL-3.0-or-later, but your derivative work can use a different license if you prefer.
-- **Recommended licenses:**
-  - **AGPL-3.0-or-later** — Ensures derivatives remain free and open. Good for plugins you want to keep community-driven.
-  - **MIT** — Permissive, widely used, minimal requirements. Good for permissive distribution.
-  - **Apache-2.0** — Permissive with explicit patent grant. Good for corporate environments.
-  - **GPL-3.0-or-later** — Copyleft without the network clause. Simpler than AGPL for non-network plugins.
-
-- **Include a LICENSE file** in your plugin's directory with your chosen license text.
-- **Add SPDX headers** to each source file (see the template files for examples).
-- **Document your license** in your plugin's README.
-
-The feedBack project itself uses AGPL-3.0-or-later to ensure the platform and its ecosystem remain free and community-driven. Your plugin's license is independent of this choice.
+See [the implementation README](visual-export/README.md) for the runtime
+pipeline and development notes.
