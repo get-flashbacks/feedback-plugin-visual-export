@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 (function visualExportPlugin() {
   'use strict';
-  const PLUGIN_ID = 'visual-export';
+  const PLUGIN_ID = 'visual_export';
   if (window.__visualExportSetup) return;
   window.__visualExportSetup = true;
 
@@ -86,7 +86,7 @@
     ctx.beginPath(); ctx.roundRect(x, y, w, h, r); return r;
   }
 
-  function createCompositor(target, includeChrome) {
+  async function createCompositor(target, includeChrome) {
     const player = document.getElementById('player');
     if (!player || !visible(player)) throw new Error('Open a song in the player before exporting.');
     const pr = player.getBoundingClientRect();
@@ -107,7 +107,7 @@
       if (r.right <= pr.left || r.left >= pr.right || r.bottom <= pr.top || r.top >= pr.bottom) return null;
       const s = getComputedStyle(el);
       const direct = Array.from(el.childNodes).some(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim());
-      const media = el instanceof HTMLCanvasElement || el instanceof HTMLVideoElement || el instanceof HTMLImageElement;
+      const media = el instanceof HTMLCanvasElement || el instanceof HTMLVideoElement || el instanceof HTMLImageElement || el instanceof SVGSVGElement;
       const bg = rgbaVisible(s.backgroundColor), border = Number.parseFloat(s.borderTopWidth) || 0;
       if (!media && !direct && !bg && !border) return null;
       return { el, r, media, direct, bg, border, z: Number.parseInt(s.zIndex, 10) || 0,
@@ -121,6 +121,23 @@
       .filter(el => !el.closest(lyricSelector)).map(describe).filter(Boolean)
       .sort((a, b) => a.z - b.z);
 
+    // Staff View renders alphaTab notation as SVG. Rasterize each top-level
+    // SVG once at export start so the synchronous frame loop can composite it
+    // like a canvas; cursor/miss canvases still refresh per timestamp.
+    for (const d of staticNodes) {
+      if (!(d.el instanceof SVGSVGElement)) continue;
+      try {
+        const xml = new XMLSerializer().serializeToString(d.el);
+        const blob = new Blob([xml], { type: 'image/svg+xml' });
+        const url = URL.createObjectURL(blob);
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        d.raster = image;
+        URL.revokeObjectURL(url);
+      } catch (_) { /* unsupported SVG remains omitted */ }
+    }
+
     function paint(d) {
       const { el, r } = d;
       if (!el.isConnected) return;
@@ -132,7 +149,7 @@
         ctx.fillStyle = d.backgroundColor; ctx.fill();
       }
       if (d.media) {
-        try { ctx.drawImage(el, x, y, w, h); } catch (_) { /* unloaded/tainted visual asset */ }
+        try { ctx.drawImage(d.raster || el, x, y, w, h); } catch (_) { /* unloaded/tainted visual asset */ }
       }
       if (d.border > 0 && rgbaVisible(d.borderColor)) {
         roundedRect(ctx, x, y, w, h, d.radius * scale);
@@ -192,10 +209,16 @@
     const audio = document.getElementById('audio');
     const player = document.getElementById('player');
     if (!audio || !player || !visible(player)) return status(dialog, 'Open a song in the player first.');
-    if (!Number.isFinite(audio.duration) || audio.duration <= 0) return status(dialog, 'Song audio is not ready yet.');
+    const songInfo = window.highway?.getSongInfo?.() || {};
+    const duration = Number.isFinite(audio.duration) && audio.duration > 0
+      ? audio.duration : Number(songInfo.duration);
+    if (!Number.isFinite(duration) || duration <= 0) return status(dialog, 'Song audio is not ready yet.');
     if (!window.VideoEncoder || !window.VideoFrame) return status(dialog, 'WebCodecs is unavailable. Use a current Chromium or Chrome build.');
-    const audioUrl = audio.currentSrc || audio.src;
-    if (!audioUrl) return status(dialog, 'This audio route cannot be exported yet. Select the browser audio output.');
+    // Prefer the pack's complete mixdown over the core audio element. When the
+    // stems plugin is active, audio.currentSrc may be only one instrument stem;
+    // in JUCE mode the element may be empty while the native player is active.
+    const audioUrl = songInfo.full_mix_url || audio.currentSrc || audio.src || window._juceAudioUrl;
+    if (!audioUrl) return status(dialog, 'No complete song mix is available for export.');
 
     const [width, height] = dialog.querySelector('[data-ve-resolution]').value.split('x').map(Number);
     const fps = Number(dialog.querySelector('[data-ve-fps]').value);
@@ -210,7 +233,7 @@
     const startBtn = dialog.querySelector('[data-ve-start]');
     const cancelBtn = dialog.querySelector('[data-ve-cancel]');
     startBtn.disabled = true; cancelBtn.hidden = false;
-    const wasPaused = audio.paused, oldTime = audio.currentTime;
+    const wasPaused = audio.paused, oldTime = window._juceMode && window.jucePlayer ? window.jucePlayer.currentTime : audio.currentTime;
     audio.pause();
     const split = window.feedBackSplitscreen || window.slopsmithSplitscreen;
     const splitActive = !!split?.isActive?.();
@@ -222,7 +245,7 @@
     }
     if (splitActive) split.beginOfflineRender?.();
     const output = document.createElement('canvas'); output.width = width; output.height = height;
-    const composeFrame = createCompositor(output, includeChrome);
+    const composeFrame = await createCompositor(output, includeChrome);
     let encoder;
     try {
       status(dialog, 'Loading source audio…', 0);
@@ -237,14 +260,14 @@
         error(err) { encodeError = err; }
       });
       encoder.configure(config);
-      const frameCount = Math.ceil(audio.duration * fps);
+      const frameCount = Math.ceil(duration * fps);
       for (let i = 0; i < frameCount; i++) {
         if (cancelled) throw new DOMException('Export cancelled', 'AbortError');
         if (encodeError) throw encodeError;
-        const t = Math.min(audio.duration, i / fps);
+        const t = Math.min(duration, i / fps);
         const painted = renderFrameAt.call(splitActive ? split : window.highway, t);
         if (painted === false) throw new Error('The selected visualization is not ready for offline rendering.');
-        updateTimelineDom(t, audio.duration);
+        updateTimelineDom(t, duration);
         composeFrame();
         const frame = new VideoFrame(output, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / fps) });
         encoder.encode(frame, { keyFrame: i % (fps * 2) === 0 }); frame.close();
@@ -261,7 +284,7 @@
       const form = new FormData();
       form.append('video', new Blob(chunks, { type: 'video/h264' }), 'frames.h264');
       form.append('audio', audioBlob, 'audio'); form.append('fps', String(fps));
-      form.append('duration', String(audio.duration));
+      form.append('duration', String(duration));
       const info = window.highway?.getSongInfo?.() || {};
       form.append('filename', `${info.artist || 'feedback'}-${info.title || 'export'}`);
       const mux = await fetch(`/api/plugins/${PLUGIN_ID}/mux`, { method: 'POST', body: form });

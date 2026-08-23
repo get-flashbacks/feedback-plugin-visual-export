@@ -45,12 +45,12 @@ The exporter relies on the following host interfaces:
 
 ## Limits
 
-- Audio must be available through the browser's HTML audio source. A mix that
-  exists only in the native/JUCE engine cannot yet be exported.
+- The exporter prefers the song package's complete `full_mix_url` when available, even
+  if the player is currently using an individual stem or native/JUCE routing.
+  Songs without a complete mix fall back to the browser audio source.
 - Supported overlays are composited in the browser; advanced third-party
   CSS/SVG/filter effects may not reproduce pixel-for-pixel.
 - Jumping Tab panes do not provide deterministic frame rendering and are not
   supported in offline split exports.
 
-See [the implementation README](visual-export/README.md) for the runtime
-pipeline and development notes.
+The runtime implementation is in `screen.js`, `routes.py`, and `settings.html`.

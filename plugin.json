@@ -1,5 +1,5 @@
 {
-  "id": "visual-export",
+  "id": "visual_export",
   "name": "Visual Export",
   "version": "0.2.0",
   "description": "Renders the current player layout to a video file for the entire song, without a live performance.",

@@ -33,7 +33,7 @@ class RoutesTest(unittest.TestCase):
                 for route in app.routes
                 for method in (route.methods or set())
             }
-        base = "/api/plugins/visual-export"
+        base = "/api/plugins/visual_export"
         self.assertIn((f"{base}/settings", "GET"), registered)
         self.assertIn((f"{base}/settings", "POST"), registered)
         self.assertIn((f"{base}/capabilities", "GET"), registered)

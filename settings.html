@@ -13,7 +13,7 @@
 (function () {
   const panel = document.querySelector('.visual-export-settings');
   if (!panel) return;
-  fetch('/api/plugins/visual-export/settings').then(r => r.json()).then(s => {
+  fetch('/api/plugins/visual_export/settings').then(r => r.json()).then(s => {
     panel.querySelector('[data-setting="resolution"]').value = `${s.width}x${s.height}`;
     panel.querySelector('[data-setting="fps"]').value = String(s.fps);
     panel.querySelector('[data-setting="bitrate_mbps"]').value = s.bitrate_mbps;
@@ -23,7 +23,7 @@
     const body = { width, height, fps: Number(panel.querySelector('[data-setting="fps"]').value),
       bitrate_mbps: Number(panel.querySelector('[data-setting="bitrate_mbps"]').value),
       include_chrome: false };
-    const r = await fetch('/api/plugins/visual-export/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    const r = await fetch('/api/plugins/visual_export/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
   });
 })();

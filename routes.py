@@ -13,7 +13,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-PLUGIN_ID = "visual-export"
+PLUGIN_ID = "visual_export"
 MAX_SETTINGS_BODY_BYTES = 16 * 1024
 MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
 MAX_AUDIO_BYTES = 1024 * 1024 * 1024
