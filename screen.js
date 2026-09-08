@@ -32,6 +32,13 @@
     btn.title = 'Render the configured player view to MP4';
     btn.addEventListener('click', openDialog);
     slot.appendChild(btn);
+    // The 1s poll below exists only to catch the slot not being ready yet at
+    // load time (a v3 chrome mount race) -- once mounted once, every future
+    // remount need is already covered by the screen:changed listener (the
+    // slot is otherwise a stable, always-reachable container per its own
+    // contract). Stop polling instead of ticking forever for the rest of
+    // the page's life once that first successful mount happens.
+    stopMountPoll();
   }
 
   function openDialog() {
@@ -243,11 +250,21 @@
       if (!wasPaused) audio.play().catch(() => {});
       return status(dialog, 'This feedBack build does not provide deterministic frame rendering. Update the host and Splitscreen plugin.');
     }
-    if (splitActive) split.beginOfflineRender?.();
     const output = document.createElement('canvas'); output.width = width; output.height = height;
-    const composeFrame = await createCompositor(output, includeChrome);
     let encoder;
+    let composeFrame;
     try {
+      // beginOfflineRender()/createCompositor() both used to run BEFORE this
+      // try — a rejection from createCompositor (or a throwing
+      // beginOfflineRender) skipped the finally block entirely: exporting
+      // stayed true (wedging every future click behind the `if (exporting)
+      // return` guard at the top of this function), the Render/Cancel
+      // buttons stayed disabled/hidden forever, and splitscreen was left in
+      // offline-render mode with no matching endOfflineRender() call. Moved
+      // inside the try so any failure here still hits the same
+      // catch/finally as a failure mid-render.
+      if (splitActive) split.beginOfflineRender?.();
+      composeFrame = await createCompositor(output, includeChrome);
       status(dialog, 'Loading source audio…', 0);
       const audioResponse = await fetch(audioUrl);
       if (!audioResponse.ok) throw new Error(`Could not load song audio (HTTP ${audioResponse.status}).`);
@@ -307,8 +324,11 @@
     }
   }
 
+  let mountTimer = setInterval(mountButton, 1000);
+  function stopMountPoll() {
+    if (mountTimer) { clearInterval(mountTimer); mountTimer = null; }
+  }
   mountButton();
-  const mountTimer = setInterval(mountButton, 1000);
-  window.addEventListener('beforeunload', () => clearInterval(mountTimer), { once: true });
+  window.addEventListener('beforeunload', stopMountPoll, { once: true });
   window.feedBack?.on?.('screen:changed', mountButton);
 })();
