@@ -136,16 +136,21 @@
     async function rasterizeSvg(el) {
       if (svgRasterCache.has(el)) return svgRasterCache.get(el);
       let image = null;
+      let url = null;
       try {
         const xml = new XMLSerializer().serializeToString(el);
         const blob = new Blob([xml], { type: 'image/svg+xml' });
-        const url = URL.createObjectURL(blob);
+        url = URL.createObjectURL(blob);
         image = new Image();
         image.src = url;
         await image.decode();
-        URL.revokeObjectURL(url);
-      } catch (_) { image = null; /* unsupported SVG remains omitted */ }
-      svgRasterCache.set(el, image);
+      } catch (_) { image = null; /* transient/unsupported — not cached, retried next frame */ }
+      finally { if (url) URL.revokeObjectURL(url); }
+      // Only cache a successful decode. A transient failure (e.g. the blob
+      // wasn't ready yet) would otherwise be pinned to null forever, since
+      // the staff-view subtree — the only caller that re-rasterizes per
+      // element reference — is re-described every frame rather than once.
+      if (image) svgRasterCache.set(el, image);
       return image;
     }
 
