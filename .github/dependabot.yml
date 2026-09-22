@@ -1,9 +1,8 @@
 version: 2
 updates:
-  # Keep GitHub Actions up to date, including SHA-pinned actions —
-  # Dependabot resolves the SHA to the tag it corresponds to and opens
-  # a PR bumping to the new release's SHA, keeping the pin fresh
-  # without giving up commit-pinning.
+  # Keep GitHub Actions up to date. Dependabot opens a PR bumping each
+  # action to its next tagged release (or resolves a SHA pin to the
+  # SHA behind a newer tag, for repos that pin by commit).
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
