@@ -9,15 +9,22 @@ this file covers the parts an agent needs that the README doesn't.
 
 ## Host contract this plugin depends on
 
-- **Single-highway export:** `window.highway.renderFrameAt(time)`. The
-  export is gated entirely on `window.highway.getSongInfo()` (checked at
-  `screen.js:219`/`305` — no `full_mix_url` means the whole export bails)
-  plus `window.highway.getSections()` for HUD text (`screen.js:198`).
-  `getCanvas()` is not called anywhere in `screen.js` despite being listed
-  here in an earlier revision of this file — don't rely on it as a
-  dependency. These were added to feedBack core in `f7c761c` (Sep 16) — see
-  `get-flashbacks/feedBack` issue #102 for the org-wide core-compatibility
-  audit that pins this and every other cross-repo floor cited below.
+- **Single-highway export:** `window.highway.renderFrameAt(time)`, added
+  to feedBack core in `f7c761c` (Sep 16) — see `get-flashbacks/feedBack`
+  issue #102 for the org-wide core-compatibility audit that pins this and
+  every other cross-repo floor cited below. The export also calls
+  `window.highway.getSongInfo()` (`screen.js:219`; `songInfo.full_mix_url`
+  is the *preferred* audio source, falling back to `audio.currentSrc` /
+  `audio.src` / `window._juceAudioUrl` at `screen.js:227` — the whole
+  export only bails when all four are empty, so a host with no
+  `getSongInfo` at all can still export via the `<audio>` element) and
+  `window.highway.getSections()` for HUD text (`screen.js:198`) — but both
+  are long-standing core APIs, present since this repo's earliest commit
+  history, and are **not** part of the `f7c761c` floor (issue #102
+  attributes only `renderFrameAt`/`renderFrame`/`setExternalFrameDriver`
+  to that commit). `getCanvas()` is not called anywhere in `screen.js`
+  despite being listed as a dependency in `README.md:40` — don't rely on
+  it.
 - **Split-layout export:** additionally needs Splitscreen's
   `beginOfflineRender()` / `renderFrameAt(time)` / `endOfflineRender()`
   bridge, added in `feedback-plugin-splitscreen` commit `87e3622a`
