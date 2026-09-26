@@ -11,9 +11,9 @@ this file covers the parts an agent needs that the README doesn't.
 
 - **Single-highway export:** `window.highway.renderFrameAt(time)`, added
   to feedBack core in `f7c761c` (Sep 16) — see `get-flashbacks/feedBack`
-  issue #102 for the org-wide core-compatibility audit that pins this and
-  the other feedBack-core floors cited below (it does not pin the
-  Splitscreen floor — see that bullet). The export also calls
+  issue #102 for the org-wide core-compatibility audit that pins this
+  floor (it does not pin the Splitscreen floor — see that bullet). The
+  export also calls
   `window.highway.getSongInfo()` (`screen.js:219`; `songInfo.full_mix_url`
   is the *preferred* audio source, falling back to `audio.currentSrc` /
   `audio.src` / `window._juceAudioUrl` at `screen.js:227` — the whole
