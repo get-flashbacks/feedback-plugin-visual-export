@@ -9,8 +9,13 @@ this file covers the parts an agent needs that the README doesn't.
 
 ## Host contract this plugin depends on
 
-- **Single-highway export:** `window.highway.renderFrameAt(time)` +
-  `getCanvas()`. Added to feedBack core in `f7c761c` (Sep 16) — see
+- **Single-highway export:** `window.highway.renderFrameAt(time)`. The
+  export is gated entirely on `window.highway.getSongInfo()` (checked at
+  `screen.js:219`/`305` — no `full_mix_url` means the whole export bails)
+  plus `window.highway.getSections()` for HUD text (`screen.js:198`).
+  `getCanvas()` is not called anywhere in `screen.js` despite being listed
+  here in an earlier revision of this file — don't rely on it as a
+  dependency. These were added to feedBack core in `f7c761c` (Sep 16) — see
   `get-flashbacks/feedBack` issue #102 for the org-wide core-compatibility
   audit that pins this and every other cross-repo floor cited below.
 - **Split-layout export:** additionally needs Splitscreen's
@@ -83,13 +88,20 @@ document."
 ## Testing
 
 ```bash
+python3 -m pip install pytest fastapi python-multipart   # none are bundled — no requirements manifest in this repo
 python3 -m pytest tests/test_routes.py
 ```
 
-One test in this file (`test_setup_registers_settings_capabilities_and_mux_routes`)
-needs `python-multipart` installed — absent in some sandboxes, in which
-case only that one test fails with a clear `RuntimeError`, not a
-collection error; the rest of the suite is unaffected.
+In a clean checkout with no dependencies preinstalled, `python3 -m pytest`
+fails outright (`No module named pytest`); after installing pytest,
+`tests/test_routes.py` fails to even **collect** (`No module named
+'fastapi'`, a module-scope import at `tests/test_routes.py:6`) — this is
+the actual first-run failure mode, not the narrower one below. Once
+`pytest` and `fastapi` are installed, one test in this file
+(`test_setup_registers_settings_capabilities_and_mux_routes`) additionally
+needs `python-multipart` — without it, only that one test fails with a
+clear `RuntimeError`, not a collection error; the rest of the suite is
+unaffected.
 
 No JS test harness exists in this repo yet — `screen.js` has no
 `node --test`-reachable exports. Verifying a `screen.js` change today
