@@ -19,21 +19,23 @@ this file covers the parts an agent needs that the README doesn't.
   export only bails when all four are empty, so a host with no
   `getSongInfo` at all can still export via the `<audio>` element) and
   `window.highway.getSections()` for HUD text (`screen.js:198`) — but both
-  are long-standing core APIs, present since this repo's earliest commit
-  history, and are **not** part of the `f7c761c` floor (issue #102
-  attributes only `renderFrameAt`/`renderFrame`/`setExternalFrameDriver`
+  are long-standing core APIs in `get-flashbacks/feedBack`'s
+  `static/highway.js`, present in all 35 commits back to its root commit
+  `6c110398` (Jun 16), and are **not** part of the `f7c761c` floor (issue
+  #102 attributes only `renderFrameAt`/`renderFrame`/`setExternalFrameDriver`
   to that commit). `getCanvas()` is not called anywhere in `screen.js`
   despite being listed as a dependency in `README.md:40` — don't rely on
   it.
 - **Split-layout export:** additionally needs Splitscreen's
   `beginOfflineRender()` / `renderFrameAt(time)` / `endOfflineRender()`
   bridge, added in `feedback-plugin-splitscreen` commit `87e3622a`
-  (manifest **v1.14.8**). Before that commit existed, **no** Splitscreen
-  version implemented this bridge at all — issues #6 and #7 in this repo
-  document that history; #7 in particular is worth reading before citing
-  any Splitscreen version as a floor, since the first two rounds of that
-  issue concluded (correctly, at the time) that no working version
-  existed yet.
+  (manifest **v1.14.8** — not pinned by issue #102, which covers only
+  feedBack-core floors; this Splitscreen version comes from that repo's
+  own history). Before that commit existed, **no** Splitscreen version
+  implemented this bridge at all — issues #6 and #7 in this repo document
+  that history; #7 in particular is worth reading before citing any
+  Splitscreen version as a floor, since the first two rounds of that issue
+  concluded (correctly, at the time) that no working version existed yet.
 - **`minHost: "1.0.0"`** in `plugin.json` reflects neither of the above —
   see issue #6. Don't treat it as accurate; it's a known-wrong placeholder
   tracked for correction, not a decision already made.
