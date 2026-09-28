@@ -107,6 +107,13 @@
     const ps = getComputedStyle(player);
     const skipChrome = el => !includeChrome && !!el.closest('#player-controls,#player-footer,#v3-railzone,[id^="v3-rail-pop-"]');
     const lyricSelector = '.splitscreen-lyrics-pane,.splitscreen-lyrics-overlay';
+    // Staff View (alphaTab) swaps its rendered SVG(s) out from under us as
+    // playback scrolls to a new system — a one-time snapshot captures
+    // whichever SVG happened to exist at export start and then keeps
+    // painting that same (soon-detached) element every frame, so the
+    // notation either never appears or freezes on the first system
+    // (issue #2). Treat it like the lyrics pane: re-described every frame.
+    const staffSelector = '[data-staffview-instance]';
 
     function describe(el) {
       if (!visible(el) || skipChrome(el)) return null;
@@ -125,24 +132,39 @@
     }
 
     const staticNodes = Array.from(player.querySelectorAll('*'))
-      .filter(el => !el.closest(lyricSelector)).map(describe).filter(Boolean)
+      .filter(el => !el.closest(lyricSelector) && !el.closest(staffSelector)).map(describe).filter(Boolean)
       .sort((a, b) => a.z - b.z);
 
-    // Staff View renders alphaTab notation as SVG. Rasterize each top-level
-    // SVG once at export start so the synchronous frame loop can composite it
-    // like a canvas; cursor/miss canvases still refresh per timestamp.
-    for (const d of staticNodes) {
-      if (!(d.el instanceof SVGSVGElement)) continue;
+    // Rasterize a <svg> to an Image so the (synchronous) per-frame paint()
+    // can composite it via drawImage — a raw SVGSVGElement isn't a valid
+    // CanvasImageSource. Cached per element so re-describing the staff-view
+    // subtree every frame doesn't re-encode/decode an unchanged SVG.
+    const svgRasterCache = new WeakMap();
+    async function rasterizeSvg(el) {
+      if (svgRasterCache.has(el)) return svgRasterCache.get(el);
+      let image = null;
+      let url = null;
       try {
-        const xml = new XMLSerializer().serializeToString(d.el);
+        const xml = new XMLSerializer().serializeToString(el);
         const blob = new Blob([xml], { type: 'image/svg+xml' });
-        const url = URL.createObjectURL(blob);
-        const image = new Image();
+        url = URL.createObjectURL(blob);
+        image = new Image();
         image.src = url;
         await image.decode();
-        d.raster = image;
-        URL.revokeObjectURL(url);
-      } catch (_) { /* unsupported SVG remains omitted */ }
+      } catch (_) { image = null; /* transient/unsupported — not cached, retried next frame */ }
+      finally { if (url) URL.revokeObjectURL(url); }
+      // Only cache a successful decode. A transient failure (e.g. the blob
+      // wasn't ready yet) would otherwise be pinned to null forever, since
+      // the staff-view subtree — the only caller that re-rasterizes per
+      // element reference — is re-described every frame rather than once.
+      if (image) svgRasterCache.set(el, image);
+      return image;
+    }
+
+    // Static SVGs (e.g. a fretboard/tab overlay that never rebuilds its
+    // markup) are rasterized once up front, same as before.
+    for (const d of staticNodes) {
+      if (d.el instanceof SVGSVGElement) d.raster = await rasterizeSvg(d.el);
     }
 
     function paint(d) {
@@ -177,7 +199,7 @@
       ctx.restore();
     }
 
-    return function composePlayerFrame() {
+    return async function composePlayerFrame() {
       ctx.fillStyle = '#000'; ctx.fillRect(0, 0, target.width, target.height);
       ctx.fillStyle = rgbaVisible(ps.backgroundColor) ? ps.backgroundColor : '#0f172a';
       ctx.fillRect(ox, oy, pr.width * scale, pr.height * scale);
@@ -187,6 +209,16 @@
       for (const root of player.querySelectorAll(lyricSelector)) {
         const dynamic = [root, ...root.querySelectorAll('*')].map(describe).filter(Boolean);
         for (const d of dynamic) paint(d);
+      }
+      // Staff View's rendered SVG(s) can be swapped out entirely as playback
+      // scrolls to a new system, so this subtree is re-described (and any
+      // new SVG re-rasterized) every frame rather than once at export start.
+      for (const root of player.querySelectorAll(staffSelector)) {
+        const dynamic = [root, ...root.querySelectorAll('*')].map(describe).filter(Boolean);
+        for (const d of dynamic) {
+          if (d.el instanceof SVGSVGElement) d.raster = await rasterizeSvg(d.el);
+          paint(d);
+        }
       }
     };
   }
@@ -285,7 +317,7 @@
         const painted = renderFrameAt.call(splitActive ? split : window.highway, t);
         if (painted === false) throw new Error('The selected visualization is not ready for offline rendering.');
         updateTimelineDom(t, duration);
-        composeFrame();
+        await composeFrame();
         const frame = new VideoFrame(output, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / fps) });
         encoder.encode(frame, { keyFrame: i % (fps * 2) === 0 }); frame.close();
         if (encoder.encodeQueueSize > 8) await encoder.flush();
