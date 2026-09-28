@@ -102,5 +102,26 @@ def test_mux_returns_mp4_and_removes_work_dir(tmp_path, monkeypatch):
     assert not work.exists()
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+def test_mux_reports_missing_ffmpeg(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: None)
+
+    response = _export(_client(tmp_path))
+    assert response.status_code == 503
+    assert response.json() == {"error": "FFmpeg is not installed"}
+
+
+def test_mux_reports_ffmpeg_failure_and_removes_work_dir(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    monkeypatch.setattr(
+        routes.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="mux failure"),
+    )
+
+    response = _export(_client(tmp_path))
+    assert response.status_code == 500
+    assert response.json() == {"error": "mux failure"}
+    assert not work.exists()
