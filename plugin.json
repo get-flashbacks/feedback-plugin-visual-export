@@ -13,5 +13,5 @@
   },
   "routes": "routes.py",
   "icon": "🎬",
-  "minHost": "1.0.0"
+  "minHost": "1.14.8"
 }
