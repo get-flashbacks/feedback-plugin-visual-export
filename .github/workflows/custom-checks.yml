@@ -38,6 +38,8 @@ jobs:
           PY
       - name: Check JavaScript syntax
         run: node --check screen.js
+      - name: Run screen.js behaviour tests
+        run: node --test tests/js/screen.test.js
       - name: Reject print calls in routes
         run: |
           ! grep -nE '(^|[^A-Za-z0-9_])(print|traceback\.print_exc)[[:space:]]*\(' routes.py

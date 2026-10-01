@@ -550,6 +550,37 @@
     } catch (_) { /* the server also expires abandoned sessions */ }
   }
 
+  // A split-layout export needs Split Screen's offline-render bridge as a whole.
+  // Split Screen's own renderFrameAt() begins `if (!active || !_offlineRenderActive
+  // ...) return false`, so beginOfflineRender() is a precondition of painting any
+  // frame, not just bookkeeping. Requiring all three up front turns the partial
+  // case into a named version error instead of a generic failure on frame 0.
+  const SPLIT_BRIDGE = ['beginOfflineRender', 'renderFrameAt', 'endOfflineRender'];
+
+  // Deterministic frame rendering is a host contract, and no host version
+  // number identifies a build that provides it: feedBack's VERSION file has
+  // read 0.3.0-alpha.2 since 2026-08-10, well before highway.renderFrameAt()
+  // landed in commit f7c761c on 2026-09-16, so no semver floor could admit
+  // exactly the builds that can export. Test the capability instead, and name
+  // the side that is actually missing -- the always-required host, or the Split
+  // Screen integration that only a split layout needs.
+  function frameDriverProblem(split, splitActive) {
+    if (typeof window.highway?.renderFrameAt !== 'function') {
+      return 'This feedBack build has no highway.renderFrameAt(), so it cannot render frames '
+        + 'deterministically. That arrived in feedBack commit f7c761c (Sep 16 2026); the host '
+        + 'version string does not identify it, so update to a build containing that commit.';
+    }
+    if (splitActive) {
+      const missing = SPLIT_BRIDGE.filter(name => typeof split?.[name] !== 'function');
+      if (missing.length) {
+        return `Split Screen is active but does not provide ${missing.join(', ')}. Offline split `
+          + 'export needs the whole offline-render bridge, which arrived in Split Screen 1.14.8 '
+          + '(commits 2301dd5 and 87e3622a). Update Split Screen; this feedBack host is new enough.';
+      }
+    }
+    return null;
+  }
+
   async function startExport(dialog) {
     if (exporting) return;
     const audio = document.getElementById('audio');
@@ -583,12 +614,13 @@
     audio.pause();
     const split = window.feedBackSplitscreen || window.slopsmithSplitscreen;
     const splitActive = !!split?.isActive?.();
-    const renderFrameAt = splitActive ? split?.renderFrameAt : window.highway?.renderFrameAt;
-    if (typeof renderFrameAt !== 'function') {
+    const driverProblem = frameDriverProblem(split, splitActive);
+    if (driverProblem) {
       exporting = false; startBtn.disabled = false; cancelBtn.hidden = true;
       if (!wasPaused) audio.play().catch(() => {});
-      return status(dialog, 'This feedBack build does not provide deterministic frame rendering. Update the host and Splitscreen plugin.');
+      return status(dialog, driverProblem);
     }
+    const renderFrameAt = splitActive ? split.renderFrameAt : window.highway.renderFrameAt;
     const output = document.createElement('canvas'); output.width = width; output.height = height;
     const info = window.highway?.getSongInfo?.() || songInfo;
     const exportName = `${info.artist || 'feedback'}-${info.title || 'export'}`;
@@ -606,7 +638,7 @@
       // offline-render mode with no matching endOfflineRender() call. Moved
       // inside the try so any failure here still hits the same
       // catch/finally as a failure mid-render.
-      if (splitActive) split.beginOfflineRender?.();
+      if (splitActive) split.beginOfflineRender();
       compositor = await createCompositor(output, includeChrome);
 
       // Issue #9, phase 3: when the host serves the song mix from its own origin
@@ -747,7 +779,7 @@
       if (backpressure) backpressure.stop();
       if (compositor) compositor.dispose();
       await discardExportSession(session);
-      if (splitActive) split.endOfflineRender?.();
+      if (splitActive) split.endOfflineRender();
       try { audio.currentTime = oldTime; } catch (_) {}
       if (!wasPaused && !cancelled) audio.play().catch(() => {});
       exporting = false; startBtn.disabled = false; cancelBtn.hidden = true;

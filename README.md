@@ -56,15 +56,51 @@ alive, the browser uploads the mix, and the mux is retried.
 The server only ever contacts that configured origin, and it refuses redirects,
 so a song URL cannot redirect the fetch to another host.
 
-## Host integration
+## Requirements
 
-The exporter relies on the following host interfaces:
+Visual Export needs four independent things. Only the first is a feedBack
+requirement; the rest are separate and are checked separately.
 
-- A highway renderer with `renderFrameAt(time)` and `getCanvas()`.
-- When exporting a split layout, Splitscreen's `beginOfflineRender()`,
-  `renderFrameAt(time)`, and `endOfflineRender()` bridge.
-- Chromium-family WebCodecs H.264 support and FFmpeg available to the server
-  through `PATH` or the desktop application's bundled `resources/bin` folder.
+### feedBack host (required for every export)
+
+- `window.highway.renderFrameAt(time)`, which paints one explicit chart time
+  without sampling the playback clock. It arrived in feedBack commit
+  `f7c761c` (Sep 16 2026); see get-flashbacks/feedBack issue #102.
+
+The exporter also calls `window.highway.getSongInfo()` and
+`window.highway.getSections()`, but both are long-standing feedBack APIs that
+predate `f7c761c` by months and are not part of the export's floor.
+
+There is deliberately **no `minHost` version in the manifest**. feedBack's
+`VERSION` file has read `0.3.0-alpha.2` since 2026-08-10 — before
+`renderFrameAt()` existed — and feedBack publishes no releases, so no version
+string identifies a build that can export. Rather than declare a number that is
+either too low or does not exist, the plugin checks for the interface itself
+and, when it is absent, says which build to update to.
+
+### Split Screen (required only when exporting a split layout)
+
+When Split Screen is active, the export additionally needs its offline-render
+bridge: `beginOfflineRender()`, `renderFrameAt(time)`, and
+`endOfflineRender()`. The bridge arrived in Split Screen **1.14.8** (commits
+`2301dd5` and `87e3622a`); 1.14.7 is the last version without it. All three are
+required together, because Split Screen's `renderFrameAt()` refuses to paint
+unless `beginOfflineRender()` has already run — so a partial bridge could never
+export in the first place. The exporter checks all three up front and reports
+the missing ones by name instead of failing mid-render. Without Split Screen
+installed, single-highway export is unaffected.
+
+### WebCodecs (browser)
+
+Chromium-family browser with H.264 `VideoEncoder` support. Missing WebCodecs is
+reported on its own, separately from any host or Split Screen problem.
+
+### FFmpeg (server)
+
+FFmpeg reachable through `PATH` or the desktop application's bundled
+`resources/bin` folder. It muxes the encoded frames with the song audio and is
+only needed once rendering succeeds, so its absence surfaces as a muxing
+failure rather than a host compatibility error.
 
 ## Limits
 
