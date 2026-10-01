@@ -486,6 +486,46 @@ def test_audio_fetch_needs_both_an_origin_and_a_path(tmp_path, monkeypatch):
     ).json()["audio_fetch"] is True
 
 
+@pytest.mark.asyncio
+async def test_overlapping_appends_share_one_cap_and_one_prefix(tmp_path, monkeypatch):
+    """Two in-flight appends must not each get a full MAX_VIDEO_BYTES.
+
+    The counter is the file's size, so it can only be read under the lock that
+    guards the writes. Snapshotting it before the acquire gave every blocked
+    request the same stale base: both appends answered 200, the file grew past
+    the cap, and a later rollback could truncate below the accepted prefix.
+    """
+    import asyncio
+
+    import httpx
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 20)
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    app = FastAPI()
+    routes.setup(app, {"config_dir": tmp_path})
+
+    async def slow_body():
+        for _ in range(4):
+            yield b"x" * 3
+            await asyncio.sleep(0.01)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        created = await client.post(
+            "/api/plugins/visual_export/sessions", json={"fps": 30, "duration": 1.0}
+        )
+        url = f"/api/plugins/visual_export/sessions/{created.json()['session']}/video"
+        responses = await asyncio.gather(
+            client.post(url, content=slow_body()), client.post(url, content=slow_body())
+        )
+
+    # Each append is 12 bytes and the cap is 20, so exactly one can fit.
+    assert sorted(r.status_code for r in responses) == [200, 400]
+    assert (work / "frames.h264").stat().st_size == 12
+
+
 def test_session_mux_reports_audio_fetch_failure_and_keeps_the_session(tmp_path, monkeypatch):
     """A fetch that fails mid-mux must not discard the rendered video."""
     work = tmp_path / "work"

@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export sessions let the browser stream encoded H.264 chunks to the server as
   they are produced instead of keeping the whole elementary stream in memory.
   The session's total encoded bytes stay capped by the existing 2 GB limit
-  across all appends. Cancelling an export still deletes the session
-  immediately, and abandoned sessions are expired server-side.
+  across all appends, including appends that overlap. Cancelling an export still
+  deletes the session immediately, and abandoned sessions are expired
+  server-side.
 - Set `FEEDBACK_PUBLIC_ORIGIN` (for example `http://127.0.0.1:5173`) to let the
   server fetch a same-host song mix itself, so the browser no longer downloads
   and re-uploads it. The server tells the browser whether it can resolve the

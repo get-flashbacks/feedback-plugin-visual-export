@@ -62,11 +62,12 @@ highway canvas is what the original implementation effectively did not do, and
 it is the whole reason runs are cut: a live canvas must be composited between
 the static pixels above and below it.
 
-**Layer bounds are snapshot-based.** A rejected `/video` append truncates the
-file back to `state["video_bytes"]`, the pre-request size — never unlink it, or
-a single over-limit chunk destroys the whole render, and never "refund" the
-counter by the rejected body size, which drives it negative and stops
-`MAX_VIDEO_BYTES` binding.
+**Layer bounds are snapshot-based, under the lock.** `video_bytes` is the
+file's size, so it may only be read *inside* `append_lock`. Snapshotting before
+the acquire gives every in-flight append the same stale base, each gets a full
+`MAX_VIDEO_BYTES` of headroom, and a rollback can truncate below the accepted
+prefix. A rejected append truncates back to that snapshot — never unlink, or a
+single over-limit chunk destroys the whole render.
 
 **Known gap: Staff View (alphaTab) notation goes stale or never
 appears.** Staff View renders sheet music as `<svg>`, swapped out by

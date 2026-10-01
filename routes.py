@@ -311,12 +311,14 @@ def setup(app: FastAPI, context: dict) -> None:
         state["touched"] = time.monotonic()
         video_path = state["work"] / "frames.h264"
         total = 0
-        # Snapshot the counter before the request: it is the file's size, so it
-        # must be restored to exactly this value on failure rather than adjusted
-        # by whatever this request happened to receive.
-        start = state["video_bytes"]
         try:
             async with state["append_lock"]:
+                # Snapshot under the lock. Reading it before would let every
+                # in-flight append take the same pre-lock base, so each would
+                # get a full MAX_VIDEO_BYTES of headroom, the cap would bind at
+                # N * MAX_VIDEO_BYTES for N appends, and a later rollback would
+                # truncate to a size below the file's real prefix.
+                start = state["video_bytes"]
                 try:
                     with video_path.open("ab") as target:
                         async for chunk in request.stream():
