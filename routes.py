@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,37 @@ def _run_ffmpeg(ffmpeg: str, video_path: Path, audio_path: Path, output_path: Pa
     )
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so a validated path cannot be bounced off-host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, f"refusing to follow {code} redirect", headers, fp)
+
+
+#: opener used only for the same-host audio fetch below. It carries no cookie
+#: or auth jar, so a 302 cannot be used to borrow the host's credentials.
+_AUDIO_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
+def _expected_origin() -> str | None:
+    """This host's own origin, from configuration only.
+
+    ``request.base_url`` is built from the client-supplied ``Host`` header, so
+    a raw client could otherwise aim the fetch at a host of its choosing. Only
+    a host configured by the operator is trusted here; when there is none the
+    audio is left for the browser to upload rather than fetched speculatively.
+    """
+    configured = os.environ.get("FEEDBACK_PUBLIC_ORIGIN", "").strip()
+    if not configured:
+        return None
+    parts = urllib.parse.urlsplit(configured if "//" in configured else "http://" + configured)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    if parts.path.rstrip("/"):
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def setup(app: FastAPI, context: dict) -> None:
     config_dir = Path(context["config_dir"])
     log = context.get("log") or logging.getLogger(f"feedBack.plugin.{PLUGIN_ID}")
@@ -209,10 +241,25 @@ def setup(app: FastAPI, context: dict) -> None:
         return data if isinstance(data, dict) else None
 
     async def _fetch_host_audio(origin: str, relative: str, target: Path) -> None:
+        """Download `relative` from `origin` without ever leaving that origin.
+
+        Redirects are refused rather than followed: validating the *path* only
+        constrains the string, never where the response came from, so a 302
+        would otherwise let this server fetch an arbitrary host. A host that
+        legitimately redirects song mixes elsewhere is better served by the
+        browser uploading the audio (the `POST /audio` route).
+        """
+
         def _download() -> None:
-            request = urllib.request.Request(origin + relative, headers={"User-Agent": "feedback-visual-export"})
+            url = origin + relative
+            request = urllib.request.Request(url, headers={"User-Agent": "feedback-visual-export"})
             total = 0
-            with urllib.request.urlopen(request, timeout=AUDIO_FETCH_TIMEOUT_SECONDS) as response, target.open("wb") as out:
+            with _AUDIO_OPENER.open(request, timeout=AUDIO_FETCH_TIMEOUT_SECONDS) as response, target.open("wb") as out:
+                # Defence in depth behind the refused redirects: confirm the
+                # response really came from the origin we asked.
+                final = urllib.parse.urlsplit(response.geturl())
+                if f"{final.scheme}://{final.netloc}" != origin:
+                    raise ValueError("song audio came from an unexpected host")
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -242,8 +289,11 @@ def setup(app: FastAPI, context: dict) -> None:
         sessions[session_id] = {
             "work": Path(tempfile.mkdtemp(prefix="feedback-visual-export-")),
             "touched": time.monotonic(),
-            "origin": str(request.base_url).rstrip("/"),
+            "origin": _expected_origin(),
             "audio_url": audio_url,
+            # Cumulative across every append, so the session as a whole is
+            # bounded by MAX_VIDEO_BYTES the way the single-request upload was.
+            "video_bytes": 0,
             # Serializes concurrent chunk appends so two overlapping requests
             # can never interleave writes into the same elementary stream.
             "append_lock": asyncio.Lock(),
@@ -265,10 +315,17 @@ def setup(app: FastAPI, context: dict) -> None:
                         if not chunk:
                             continue
                         total += len(chunk)
-                        if total > MAX_VIDEO_BYTES:
+                        # Running total, not this request's total: streaming must
+                        # not turn the old whole-upload cap into a per-chunk one.
+                        if state["video_bytes"] + total > MAX_VIDEO_BYTES:
                             raise ValueError("encoded video is too large")
                         target.write(chunk)
+                state["video_bytes"] += total
         except (OSError, ValueError) as exc:
+            # Don't leave a partial stream behind for a later mux to pick up.
+            if total:
+                state["video_bytes"] -= total
+                video_path.unlink(missing_ok=True)
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"bytes": total})
 
@@ -318,10 +375,12 @@ def setup(app: FastAPI, context: dict) -> None:
             if not video_path.is_file() or video_path.stat().st_size == 0:
                 raise ValueError("no encoded video was uploaded for this session")
             audio_url = data.get("audio_url", state["audio_url"])
-            if audio_url is None:
+            origin = state["origin"]
+            if audio_url is None or origin is None:
                 if audio_path.is_file():
                     # The browser uploaded the mix itself (an audio source the
-                    # server cannot resolve on its own).
+                    # server cannot resolve on its own, or a host with no
+                    # configured public origin to fetch from).
                     pass
                 else:
                     raise ValueError("no song audio was recorded for this session")
@@ -329,7 +388,7 @@ def setup(app: FastAPI, context: dict) -> None:
                 relative = _same_host_path(audio_url)
                 if relative is None:
                     raise ValueError("audio_url must be a same-host path")
-                await _fetch_host_audio(state["origin"], relative, audio_path)
+                await _fetch_host_audio(origin, relative, audio_path)
             proc = await asyncio.to_thread(
                 _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
             )

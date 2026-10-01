@@ -356,14 +356,16 @@
         // rather than cached; style-derived fields stay cached until the
         // subtree actually changes.
         const r = d.el.getBoundingClientRect();
-        // A cached descriptor that leaves the captured area (or collapses to
-        // nothing, e.g. display:none) is dropped and the root is re-described
-        // so the next pass forgets it entirely.
-        if (r.width <= 0 || r.height <= 0
-          || r.right <= pr.left || r.left >= pr.right || r.bottom <= pr.top || r.top >= pr.bottom) {
-          state.dirty = true;
-          continue;
-        }
+        // Two different situations that must not share one flag. A collapsed
+        // box means the element stopped existing, so re-describe and let
+        // describe() forget it. Merely scrolling outside the captured area is
+        // the *normal* state for a lyrics pane -- marking the root dirty for it
+        // would re-run describe() across the whole subtree every frame, which
+        // is exactly the querySelectorAll + getComputedStyle cost this cache
+        // exists to avoid. The rect is re-measured per frame, so a descriptor
+        // that scrolls back in is picked up immediately.
+        if (r.width <= 0 || r.height <= 0) { state.dirty = true; continue; }
+        if (r.right <= pr.left || r.left >= pr.right || r.bottom <= pr.top || r.top >= pr.bottom) continue;
         d.r = r;
         // Staff View's rendered SVG(s) are swapped out entirely as playback
         // scrolls to a new system, so rasterize per element reference and
@@ -381,9 +383,16 @@
     const timelineClock = document.getElementById('hud-time');
     const timelineName = document.getElementById('v3-upnext-name');
     const timelineEta = document.getElementById('v3-upnext-eta');
-    // Player chrome is excluded from capture by default, so writing the HUD
-    // text back into the DOM every frame only costs layout and style
-    // invalidations for pixels that are never captured.
+    // The HUD is captured only if it survives skipChrome, and it currently
+    // does: in the host's v3 shell #player-hud is a sibling of
+    // #player-controls under #player, so `captured()` is true and these writes
+    // still happen every frame, exactly as before this change. The guard is
+    // what keeps that correct if the HUD is ever added to skipChrome (the
+    // host's own chrome-hide list in static/v3/index.html already excludes
+    // #player-hud) -- writing text into chrome that is not captured would only
+    // cost layout and style invalidations. Do not "optimize" this by dropping
+    // the guard: removing #player-hud from exports is a user-visible output
+    // change, not a performance fix.
     const captured = el => !!el && !skipChrome(el);
 
     function updateTimeline(t, duration) {
@@ -448,10 +457,16 @@
   // drains the whole encoder and serializes rendering behind it; here the
   // frame loop only pauses while the encode queue is above the high-water
   // mark and resumes from the encoder's own `dequeue` event once it falls back
-  // below the low-water mark. The interval is a watchdog for the rare case
-  // where no dequeue event arrives (a queued frame can still be flushed by a
-  // close/flush), never the normal path.
+  // below the low-water mark.
+  //
+  // `dequeue` only shipped in Chromium 106, but the capability gate at the top
+  // of startExport() is satisfied from 94, so probe for it rather than
+  // assuming: `'ondequeue' in encoder` is true exactly where the WebCodecs IDL
+  // exposes the handler. Where it is absent the interval below is the only
+  // resume path, so it runs far more often instead of stalling 50 ms per park.
   function createEncodeBackpressure(encoder) {
+    const hasDequeue = 'ondequeue' in encoder;
+    const pollMs = hasDequeue ? 50 : 4;
     let release = null;
     let watchdog = 0;
     const drain = () => {
@@ -460,18 +475,18 @@
       clearInterval(watchdog); watchdog = 0;
       resume();
     };
-    encoder.addEventListener('dequeue', drain);
+    if (hasDequeue) encoder.addEventListener('dequeue', drain);
     return {
       async wait() {
         if (encoder.encodeQueueSize <= ENCODE_HIGH_WATER) return;
         await new Promise(resolve => {
           release = resolve;
-          watchdog = setInterval(drain, 50);
+          watchdog = setInterval(drain, pollMs);
           drain();
         });
       },
       stop() {
-        encoder.removeEventListener('dequeue', drain);
+        if (hasDequeue) encoder.removeEventListener('dequeue', drain);
         clearInterval(watchdog); watchdog = 0;
         if (release) { const resume = release; release = null; resume(); }
       }

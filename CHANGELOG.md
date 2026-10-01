@@ -14,9 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration that was used.
 - Export sessions let the browser stream encoded H.264 chunks to the server as
   they are produced instead of keeping the whole elementary stream in memory.
-  The server fetches a same-host song mix itself, so the browser no longer
-  downloads and re-uploads it. Cancelling an export still deletes the session
+  The session's total encoded bytes stay capped by the existing 2 GB limit
+  across all appends. Cancelling an export still deletes the session
   immediately, and abandoned sessions are expired server-side.
+- Set `FEEDBACK_PUBLIC_ORIGIN` (for example `http://127.0.0.1:5173`) to let the
+  server fetch a same-host song mix itself, so the browser no longer downloads
+  and re-uploads it. Without it, or for a mix the server cannot fetch, the
+  browser uploads the audio once to the session as before. The fetch refuses
+  redirects and only ever contacts that configured origin — the `Host` header
+  is not trusted to choose it.
 
 ### Changed
 
@@ -31,5 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canvases, videos, lyrics, and Staff View are still painted per frame, and
   their descriptors are now cached and invalidated from a mutation observer on
   the affected subtree rather than re-queried every frame.
-- The HUD timeline text is no longer written into the DOM while the player
-  chrome that displays it is excluded from the capture.
+- The HUD timeline text is only written while the chrome displaying it is
+  captured. In the host's current v3 shell `#player-hud` is a sibling of
+  `#player-controls`, so it is captured and these writes still happen every
+  frame; the guard is what keeps them correct if the HUD is ever excluded.

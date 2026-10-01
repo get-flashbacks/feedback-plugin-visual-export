@@ -77,16 +77,29 @@ merged.
 The frame loop never calls `flush()` except once at the end. It applies
 backpressure from the encoder's `dequeue` event instead
 (`createEncodeBackpressure`, high/low watermarks) so rendering, compositing,
-and encoding stay pipelined. Hardware encoding is requested via
-`hardwareAcceleration: 'prefer-hardware'` first, with the previous
-configuration as the fallback. The progress UI reports elapsed time and
-realtime factor so changes are measurable — see issue #9.
+and encoding stay pipelined. `dequeue` only exists from Chromium 106 while the
+`VideoEncoder`/`VideoFrame` capability gate is satisfied from 94, so
+`createEncodeBackpressure` probes `'ondequeue' in encoder` and polls faster
+when it is absent — don't assume the event exists. Hardware encoding is
+requested via `hardwareAcceleration: 'prefer-hardware'` first, with the
+previous configuration as the fallback. The progress UI reports elapsed time
+and realtime factor so changes are measurable — see issue #9.
 
 Encoded chunks go to a server-side export session (`/sessions`, streamed to
 `/sessions/{id}/video`) when those routes exist; the browser falls back to
 buffering everything and POSTing `/mux` when the host predates them or the
 audio source needs uploading. Session temp dirs are cleaned on cancel, on mux,
 and by a TTL sweep — keep all three paths.
+
+**Server-side audio resolution is opt-in and origin-pinned.** The browser only
+ever sends a site-relative `audio_url`, but that constrains the path, not the
+destination: `urlopen` follows cross-origin 30x, and `request.base_url` is built
+from the client-controlled `Host` header. So the origin comes from the
+`FEEDBACK_PUBLIC_ORIGIN` environment variable alone (`_expected_origin()`), and
+`_AUDIO_OPENER` refuses every redirect plus double-checks `response.geturl()`.
+Unset the variable, or give a mix the server can't fetch, and the browser
+uploads the audio instead — that path must keep working. Don't "simplify" this
+by reading the origin off the request.
 
 **Known non-goal:** Jumping Tab panes don't provide deterministic frame
 rendering and aren't supported in offline split exports (README's own

@@ -2,10 +2,10 @@ import importlib.util
 import io
 import tempfile
 import unittest
-import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -170,10 +170,15 @@ def _session(client, **payload):
     return client.post("/api/plugins/visual_export/sessions", json=body)
 
 
-def _stub_audio(monkeypatch, audio=b"audio"):
+def _stub_audio(monkeypatch, audio=b"audio", origin="http://feedback.test"):
     """Stand in for the host serving the song mix back over its own origin."""
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", origin)
 
     class _Response(io.BytesIO):
+        def __init__(self, request):
+            super().__init__(audio)
+            self._url = str(request.full_url)
+
         def __enter__(self):
             return self
 
@@ -181,12 +186,44 @@ def _stub_audio(monkeypatch, audio=b"audio"):
             self.close()
             return False
 
-    def fake_urlopen(request, timeout=None):
-        assert str(request.full_url).endswith("/songs/pack/full_mix.wav")
-        assert timeout is not None
-        return _Response(audio)
+        def geturl(self):
+            return self._url
 
-    monkeypatch.setattr(routes.urllib.request, "urlopen", fake_urlopen)
+    class _Opener:
+        def open(self, request, timeout=None):
+            assert str(request.full_url).endswith("/songs/pack/full_mix.wav")
+            assert str(request.full_url).startswith(origin + "/")
+            assert timeout is not None
+            return _Response(request)
+
+    monkeypatch.setattr(routes, "_AUDIO_OPENER", _Opener())
+
+
+def test_audio_opener_refuses_redirects(tmp_path, monkeypatch):
+    """A validated path must not be usable to fetch some other host."""
+    import http.server
+    import threading
+    import urllib.error
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", "http://elsewhere.invalid/secret")
+            self.end_headers()
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            routes._AUDIO_OPENER.open(
+                f"http://127.0.0.1:{server.server_address[1]}/songs/full_mix.wav", timeout=5
+            )
+        assert caught.value.code == 302
+    finally:
+        server.shutdown()
 
 
 def _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"audio"):
@@ -262,17 +299,61 @@ def test_session_rejects_audio_url_that_is_not_same_host(tmp_path, monkeypatch):
     assert response.json() == {"error": "audio_url must be a same-host path"}
 
 
-def test_session_video_upload_enforces_size_limit(tmp_path, monkeypatch):
+def test_session_video_upload_enforces_size_limit_across_appends(tmp_path, monkeypatch):
     work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
-    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 3)
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 5)
     monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
     client = _client(tmp_path)
     session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
 
+    # Each append is under the limit on its own; the session total must still be
+    # capped, or streaming silently removes the bound the old upload had.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/video", content=b"three"
+    ).status_code == 200
     response = client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"four")
     assert response.status_code == 400
     assert "too large" in response.json()["error"]
+    # A rejected append must not leave a partial stream for a later mux.
+    assert not (work / "frames.h264").exists()
+
+
+def test_audio_fetch_requires_a_configured_origin(tmp_path, monkeypatch):
+    """A client-supplied Host header must not be able to aim the fetch.
+
+    _expected_origin() is the only source of the origin the audio fetch uses;
+    without one configured the server leaves the audio for the browser to send.
+    """
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    monkeypatch.delenv("FEEDBACK_PUBLIC_ORIGIN", raising=False)
+    _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"uploaded mix")
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    # Even with an attacker-chosen Host, nothing is fetched server-side, so the
+    # mux asks for the uploaded audio instead.
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux",
+        json={"fps": 30, "duration": 1.0},
+        headers={"Host": "attacker.example"},
+    )
+    assert response.status_code == 400
+    assert "no song audio" in response.json()["error"]
+    assert not work.exists()
+
+
+def test_expected_origin_ignores_unusable_configuration(monkeypatch):
+    for value in ("", "   ", "https://host/app", "ftp://host", "not a url/../x"):
+        monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", value)
+        assert routes._expected_origin() is None, value
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://127.0.0.1:5173")
+    assert routes._expected_origin() == "http://127.0.0.1:5173"
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "https://feedback.example")
+    assert routes._expected_origin() == "https://feedback.example"
 
 
 def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, monkeypatch):
@@ -280,10 +361,13 @@ def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, 
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
 
-    def fail_urlopen(request, timeout=None):
-        raise OSError("connection refused")
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
 
-    monkeypatch.setattr(routes.urllib.request, "urlopen", fail_urlopen)
+    class _Failing:
+        def open(self, request, timeout=None):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(routes, "_AUDIO_OPENER", _Failing())
     client = _client(tmp_path)
     session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
     client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
