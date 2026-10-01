@@ -411,13 +411,18 @@ def test_audio_fetch_requires_a_configured_origin(tmp_path, monkeypatch):
     assert not work.exists()
 
 
-def test_session_advertises_audio_fetch_only_when_configured(tmp_path, monkeypatch):
+def test_session_advertises_audio_fetch_only_when_it_can_resolve(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     _isolated_work(tmp_path, monkeypatch)
     monkeypatch.delenv("FEEDBACK_PUBLIC_ORIGIN", raising=False)
-    assert _session(_client(tmp_path)).json()["audio_fetch"] is False
+    # No origin configured: the server cannot fetch anything, whatever the path.
+    assert _session(_client(tmp_path), audio_url="/songs/pack/full_mix.wav").json()["audio_fetch"] is False
     monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
-    assert _session(_client(tmp_path)).json()["audio_fetch"] is True
+    # Origin but no path: still nothing to resolve, so no capability.
+    assert _session(_client(tmp_path)).json()["audio_fetch"] is False
+    assert _session(
+        _client(tmp_path), audio_url="/songs/pack/full_mix.wav"
+    ).json()["audio_fetch"] is True
 
 
 def test_expected_origin_ignores_unusable_configuration(monkeypatch):
@@ -428,6 +433,57 @@ def test_expected_origin_ignores_unusable_configuration(monkeypatch):
     assert routes._expected_origin() == "http://127.0.0.1:5173"
     monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "https://feedback.example")
     assert routes._expected_origin() == "https://feedback.example"
+
+
+def test_session_mux_with_explicit_null_audio_url_uses_the_stored_path(tmp_path, monkeypatch):
+    """The browser always sends `audio_url`, as null when it has no path.
+
+    `dict.get(key, default)` only falls back when the key is absent, so an
+    explicit null used to resolve to None and 409 the mux -- making the
+    server-side fetch unreachable from the shipped client and the optimization
+    dead in the only configuration that enables it.
+    """
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    fetched = []
+    _stub_audio(monkeypatch)
+    _stub_ffmpeg(monkeypatch, work)
+    original = routes._AUDIO_OPENER.open
+
+    def recording_open(request, timeout=None):
+        fetched.append(str(request.full_url))
+        return original(request, timeout=timeout)
+
+    monkeypatch.setattr(routes._AUDIO_OPENER, "open", recording_open)
+
+    client = _client(tmp_path)
+    created = _session(client, audio_url="/songs/pack/full_mix.wav").json()
+    session = created["session"]
+    assert created["audio_fetch"] is True
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    # Exactly what startExport sends on the serverWillFetch path.
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux",
+        json={"fps": 30, "duration": 1.0, "filename": "song", "audio_url": None},
+    )
+    assert response.status_code == 200
+    assert response.content == b"mp4"
+    # The mix crossed the network once, server-side, and was not uploaded.
+    assert fetched == ["http://feedback.test/songs/pack/full_mix.wav"]
+
+
+def test_audio_fetch_needs_both_an_origin_and_a_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    _isolated_work(tmp_path, monkeypatch)
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
+    # A configured origin with nothing to resolve must not advertise the
+    # capability, or the browser skips an upload the server cannot replace.
+    assert _session(_client(tmp_path)).json()["audio_fetch"] is False
+    assert _session(
+        _client(tmp_path), audio_url="/songs/pack/full_mix.wav"
+    ).json()["audio_fetch"] is True
 
 
 def test_session_mux_reports_audio_fetch_failure_and_keeps_the_session(tmp_path, monkeypatch):

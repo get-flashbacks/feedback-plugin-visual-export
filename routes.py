@@ -298,7 +298,10 @@ def setup(app: FastAPI, context: dict) -> None:
             # can never interleave writes into the same elementary stream.
             "append_lock": asyncio.Lock(),
         }
-        return JSONResponse({"session": session_id, "audio_fetch": sessions[session_id]["origin"] is not None})
+        return JSONResponse({"session": session_id,
+                             # Only true when this session can actually resolve a
+                             # mix: both a configured origin and a path to use.
+                             "audio_fetch": bool(sessions[session_id]["origin"] and audio_url)})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/video")
     async def append_session_video(session_id: str, request: Request) -> JSONResponse:
@@ -314,30 +317,35 @@ def setup(app: FastAPI, context: dict) -> None:
         start = state["video_bytes"]
         try:
             async with state["append_lock"]:
-                with video_path.open("ab") as target:
-                    async for chunk in request.stream():
-                        if not chunk:
-                            continue
-                        total += len(chunk)
-                        # Running total, not this request's total: streaming must
-                        # not turn the old whole-upload cap into a per-request one.
-                        if start + total > MAX_VIDEO_BYTES:
-                            raise ValueError("encoded video is too large")
-                        target.write(chunk)
-                state["video_bytes"] = start + total
-        except (OSError, ValueError) as exc:
-            # Roll back to the pre-request size: drop only this request's bytes,
-            # keeping the chunks already accepted, and leave the counter equal
-            # to the file's real size.
-            state["video_bytes"] = start
-            if total:
                 try:
-                    os.truncate(video_path, start)
-                except OSError:
-                    # The file is unusable anyway; drop it rather than leave a
-                    # partial stream for a later mux to pick up.
-                    state["video_bytes"] = 0
-                    video_path.unlink(missing_ok=True)
+                    with video_path.open("ab") as target:
+                        async for chunk in request.stream():
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            # Running total, not this request's total: streaming
+                            # must not turn the old whole-upload cap into a
+                            # per-request one.
+                            if start + total > MAX_VIDEO_BYTES:
+                                raise ValueError("encoded video is too large")
+                            target.write(chunk)
+                    state["video_bytes"] = start + total
+                except (OSError, ValueError):
+                    # Roll back inside the lock. Doing it after release would
+                    # let a concurrent append land between the write and the
+                    # truncate, and this rollback would then discard an accepted
+                    # chunk and un-bind the cap.
+                    state["video_bytes"] = start
+                    if total:
+                        try:
+                            os.truncate(video_path, start)
+                        except OSError:
+                            # The file is unusable anyway; drop it rather than
+                            # leave a partial stream for a later mux to pick up.
+                            state["video_bytes"] = 0
+                            video_path.unlink(missing_ok=True)
+                    raise
+        except (OSError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"bytes": total})
 
@@ -388,7 +396,11 @@ def setup(app: FastAPI, context: dict) -> None:
         # redirect now refused) leaves the session intact so the browser can
         # upload the audio and ask again, instead of losing a full render at
         # the last step.
-        audio_url = data.get("audio_url", state["audio_url"])
+        # `dict.get(key, default)` only falls back when the key is ABSENT, and
+        # the browser always sends `audio_url` -- as null when it has already
+        # uploaded the mix or wants the session's stored path. So an explicit
+        # null means "no opinion", not "no audio".
+        audio_url = data.get("audio_url") or state["audio_url"]
         origin = state["origin"]
         if not audio_path.is_file():
             relative = _same_host_path(audio_url) if audio_url is not None else None

@@ -536,7 +536,10 @@
       if (!response.ok) return null;
       const data = await response.json();
       if (!data || typeof data.session !== 'string') return null;
-      return { id: data.session, audioFetch: data.audio_fetch !== false };
+      // Fail closed: only an explicit true skips the upload. Treating a
+      // missing key as true would skip the upload against a server that never
+      // said it could fetch, and the mux would then fail after the full render.
+      return { id: data.session, audioFetch: data.audio_fetch === true };
     } catch (_) { return null; }
   }
 
