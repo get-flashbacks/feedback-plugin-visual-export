@@ -8,6 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
@@ -15,8 +20,17 @@ from fastapi.responses import FileResponse, JSONResponse
 
 PLUGIN_ID = "visual_export"
 MAX_SETTINGS_BODY_BYTES = 16 * 1024
+MAX_SESSION_BODY_BYTES = 16 * 1024
 MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
 MAX_AUDIO_BYTES = 1024 * 1024 * 1024
+# Issue #9, phase 3: a session is abandoned if the browser goes away mid-export
+# (closed tab, crashed render), so live sessions are swept on creation.
+SESSION_TTL_SECONDS = 2 * 60 * 60
+MAX_SESSIONS = 8
+# Same-host package audio is resolved server-side so the browser never has to
+# download and re-upload the song mix. Anything that isn't a plain same-origin
+# path is refused here and the browser falls back to uploading it itself.
+AUDIO_FETCH_TIMEOUT_SECONDS = 60
 _DEFAULTS = {
     "width": 1920,
     "height": 1080,
@@ -71,6 +85,47 @@ async def _save_upload(upload: UploadFile, path: Path, limit: int) -> None:
             target.write(chunk)
 
 
+def _valid_timing(fps: object, duration: object) -> bool:
+    if isinstance(fps, bool) or not isinstance(fps, int) or fps not in {24, 30, 60}:
+        return False
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        return False
+    return 0 < duration <= 8 * 60 * 60
+
+
+def _safe_filename(name: object) -> str:
+    if not isinstance(name, str):
+        return ""
+    return "".join(c for c in name if c.isalnum() or c in "-_").strip("-_")
+
+
+def _same_host_path(url: object) -> str | None:
+    """Return `url` when it is a same-origin absolute path, else None.
+
+    Only site-relative paths are accepted: a scheme, a protocol-relative
+    "//host" prefix, backslashes or any ".." segment could otherwise point the
+    server at a different host or outside the song library.
+    """
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        return None
+    if not url.startswith("/") or url.startswith("//"):
+        return None
+    if "\\" in url or any(urllib.parse.urlsplit(part).scheme or part == ".." for part in url.split("/")):
+        return None
+    return url
+
+
+def _run_ffmpeg(ffmpeg: str, video_path: Path, audio_path: Path, output_path: Path, fps: int, duration: float) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-r", str(fps),
+         "-f", "h264", "-i", str(video_path), "-i", str(audio_path),
+         "-t", f"{duration:.6f}", "-c:v", "copy", "-c:a", "aac",
+         "-b:a", "192k", "-movflags", "+faststart", str(output_path)],
+        capture_output=True, text=True,
+        timeout=max(120, int(duration * 2)), check=False,
+    )
+
+
 def setup(app: FastAPI, context: dict) -> None:
     config_dir = Path(context["config_dir"])
     log = context.get("log") or logging.getLogger(f"feedBack.plugin.{PLUGIN_ID}")
@@ -118,7 +173,186 @@ def setup(app: FastAPI, context: dict) -> None:
 
     @app.get(f"/api/plugins/{PLUGIN_ID}/capabilities")
     def capabilities() -> JSONResponse:
-        return JSONResponse({"ffmpeg": bool(_ffmpeg_cmd()), "format": "mp4"})
+        return JSONResponse({"ffmpeg": bool(_ffmpeg_cmd()), "format": "mp4", "sessions": True})
+
+    # Issue #9, phase 3: streaming export sessions. The browser posts encoded
+    # H.264 chunks as the encoder produces them, so the complete elementary
+    # stream is never held in browser memory, and the server resolves the
+    # song mix from its own host instead of receiving an uploaded copy. The
+    # single-request /mux route below stays available and unchanged as the
+    # fallback for hosts or sources that cannot use a session.
+    sessions: dict[str, dict] = {}
+
+    def _drop_session(session_id: str) -> None:
+        state = sessions.pop(session_id, None)
+        if state:
+            shutil.rmtree(state["work"], ignore_errors=True)
+
+    def _sweep_sessions() -> None:
+        now = time.monotonic()
+        for session_id, state in list(sessions.items()):
+            if now - state["touched"] > SESSION_TTL_SECONDS:
+                log.info("%s: expiring abandoned export session %s", PLUGIN_ID, session_id)
+                _drop_session(session_id)
+        while len(sessions) >= MAX_SESSIONS:
+            oldest = min(sessions, key=lambda key: sessions[key]["touched"])
+            _drop_session(oldest)
+
+    async def _json_body(request: Request) -> dict | None:
+        raw = await request.body()
+        if len(raw) > MAX_SESSION_BODY_BYTES:
+            return None
+        try:
+            data = json.loads(raw)
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _fetch_host_audio(origin: str, relative: str, target: Path) -> None:
+        def _download() -> None:
+            request = urllib.request.Request(origin + relative, headers={"User-Agent": "feedback-visual-export"})
+            total = 0
+            with urllib.request.urlopen(request, timeout=AUDIO_FETCH_TIMEOUT_SECONDS) as response, target.open("wb") as out:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_AUDIO_BYTES:
+                        raise ValueError("song audio is too large")
+                    out.write(chunk)
+
+        await asyncio.to_thread(_download)
+
+    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions")
+    async def create_session(request: Request) -> JSONResponse:
+        ffmpeg = _ffmpeg_cmd()
+        if not ffmpeg:
+            return JSONResponse({"error": "FFmpeg is not installed"}, status_code=503)
+        data = await _json_body(request)
+        if data is None:
+            return JSONResponse({"error": "invalid session request"}, status_code=400)
+        if not _valid_timing(data.get("fps"), data.get("duration")):
+            return JSONResponse({"error": "invalid export timing"}, status_code=400)
+        audio_url = data.get("audio_url")
+        if audio_url is not None and _same_host_path(audio_url) is None:
+            return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
+        _sweep_sessions()
+        session_id = uuid.uuid4().hex
+        sessions[session_id] = {
+            "work": Path(tempfile.mkdtemp(prefix="feedback-visual-export-")),
+            "touched": time.monotonic(),
+            "origin": str(request.base_url).rstrip("/"),
+            "audio_url": audio_url,
+            # Serializes concurrent chunk appends so two overlapping requests
+            # can never interleave writes into the same elementary stream.
+            "append_lock": asyncio.Lock(),
+        }
+        return JSONResponse({"session": session_id})
+
+    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/video")
+    async def append_session_video(session_id: str, request: Request) -> JSONResponse:
+        state = sessions.get(session_id)
+        if state is None:
+            return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+        state["touched"] = time.monotonic()
+        video_path = state["work"] / "frames.h264"
+        total = 0
+        try:
+            async with state["append_lock"]:
+                with video_path.open("ab") as target:
+                    async for chunk in request.stream():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_VIDEO_BYTES:
+                            raise ValueError("encoded video is too large")
+                        target.write(chunk)
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"bytes": total})
+
+    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/audio")
+    async def upload_session_audio(session_id: str, request: Request) -> JSONResponse:
+        state = sessions.get(session_id)
+        if state is None:
+            return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+        state["touched"] = time.monotonic()
+        audio_path = state["work"] / "audio.bin"
+        if audio_path.exists():
+            return JSONResponse({"error": "audio was already uploaded for this session"}, status_code=409)
+        total = 0
+        try:
+            with audio_path.open("wb") as target:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_AUDIO_BYTES:
+                        raise ValueError("song audio is too large")
+                    target.write(chunk)
+        except (OSError, ValueError) as exc:
+            audio_path.unlink(missing_ok=True)
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"bytes": total})
+
+    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/mux")
+    async def mux_session(background_tasks: BackgroundTasks, session_id: str, request: Request):
+        ffmpeg = _ffmpeg_cmd()
+        if not ffmpeg:
+            return JSONResponse({"error": "FFmpeg is not installed"}, status_code=503)
+        state = sessions.get(session_id)
+        if state is None:
+            return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+        data = await _json_body(request)
+        if data is None:
+            return JSONResponse({"error": "invalid session request"}, status_code=400)
+        if not _valid_timing(data.get("fps"), data.get("duration")):
+            return JSONResponse({"error": "invalid export timing"}, status_code=400)
+        # Pop the session first: every exit path below is responsible for
+        # removing its temporary directory, and a mux must not be repeatable.
+        work = state["work"]
+        sessions.pop(session_id, None)
+        video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
+        try:
+            if not video_path.is_file() or video_path.stat().st_size == 0:
+                raise ValueError("no encoded video was uploaded for this session")
+            audio_url = data.get("audio_url", state["audio_url"])
+            if audio_url is None:
+                if audio_path.is_file():
+                    # The browser uploaded the mix itself (an audio source the
+                    # server cannot resolve on its own).
+                    pass
+                else:
+                    raise ValueError("no song audio was recorded for this session")
+            else:
+                relative = _same_host_path(audio_url)
+                if relative is None:
+                    raise ValueError("audio_url must be a same-host path")
+                await _fetch_host_audio(state["origin"], relative, audio_path)
+            proc = await asyncio.to_thread(
+                _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
+            )
+            if proc.returncode != 0 or not output_path.is_file():
+                detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
+                log.error("%s: mux failed: %s", PLUGIN_ID, detail)
+                shutil.rmtree(work, ignore_errors=True)
+                return JSONResponse({"error": detail}, status_code=500)
+        except (OSError, ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        safe_name = _safe_filename(data.get("filename")) or "feedback-export"
+        background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
+        return FileResponse(output_path, media_type="video/mp4", filename=safe_name + ".mp4",
+                            background=background_tasks)
+
+    @app.delete(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}")
+    async def cancel_session(session_id: str) -> JSONResponse:
+        if session_id not in sessions:
+            return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+        _drop_session(session_id)
+        return JSONResponse({"status": "cancelled"})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/mux")
     async def mux_export(
@@ -132,7 +366,7 @@ def setup(app: FastAPI, context: dict) -> None:
         ffmpeg = _ffmpeg_cmd()
         if not ffmpeg:
             return JSONResponse({"error": "FFmpeg is not installed"}, status_code=503)
-        if fps not in {24, 30, 60} or not (0 < duration <= 8 * 60 * 60):
+        if not _valid_timing(fps, duration):
             return JSONResponse({"error": "invalid export timing"}, status_code=400)
         work = Path(tempfile.mkdtemp(prefix="feedback-visual-export-"))
         video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
@@ -140,13 +374,7 @@ def setup(app: FastAPI, context: dict) -> None:
             await _save_upload(video, video_path, MAX_VIDEO_BYTES)
             await _save_upload(audio, audio_path, MAX_AUDIO_BYTES)
             proc = await asyncio.to_thread(
-                subprocess.run,
-                [ffmpeg, "-y", "-loglevel", "error", "-r", str(fps),
-                 "-f", "h264", "-i", str(video_path), "-i", str(audio_path),
-                 "-t", f"{duration:.6f}", "-c:v", "copy", "-c:a", "aac",
-                 "-b:a", "192k", "-movflags", "+faststart", str(output_path)],
-                capture_output=True, text=True,
-                timeout=max(120, int(duration * 2)), check=False,
+                _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, fps, float(duration)
             )
             if proc.returncode != 0 or not output_path.is_file():
                 detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
@@ -160,10 +388,10 @@ def setup(app: FastAPI, context: dict) -> None:
             await video.close()
             await audio.close()
 
-        safe_name = "".join(c for c in filename if c.isalnum() or c in "-_").strip("-_")
+        safe_name = _safe_filename(filename) or "feedback-export"
         background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
         return FileResponse(output_path, media_type="video/mp4",
-                            filename=(safe_name or "feedback-export") + ".mp4",
+                            filename=safe_name + ".mp4",
                             background=background_tasks)
 
     log.info("%s: routes registered", PLUGIN_ID)

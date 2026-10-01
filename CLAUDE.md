@@ -14,12 +14,12 @@ this file covers the parts an agent needs that the README doesn't.
   issue #102 for the org-wide core-compatibility audit that pins this
   floor (it does not pin the Splitscreen floor — see that bullet). The
   export also calls
-  `window.highway.getSongInfo()` (`screen.js:219`; `songInfo.full_mix_url`
+  `window.highway.getSongInfo()` (`screen.js:533`; `songInfo.full_mix_url`
   is the *preferred* audio source, falling back to `audio.currentSrc` /
-  `audio.src` / `window._juceAudioUrl` at `screen.js:227` — the whole
+  `audio.src` / `window._juceAudioUrl` (`screen.js:541`) — the whole
   export only bails when all four are empty, so a host with no
   `getSongInfo` at all can still export via the `<audio>` element) and
-  `window.highway.getSections()` for HUD text (`screen.js:198`) — but both
+  `window.highway.getSections()` for HUD text (`screen.js:392`) — but both
   are long-standing core APIs in `get-flashbacks/feedBack`'s
   `static/highway.js`, present in all 35 commits back to its root commit
   `6c110398` (Jun 16), and are **not** part of the `f7c761c` floor (issue
@@ -43,30 +43,50 @@ this file covers the parts an agent needs that the README doesn't.
 - Chromium-family WebCodecs H.264 support, and FFmpeg reachable via `PATH`
   or the desktop app's bundled `resources/bin`.
 
-## Frame capture: static snapshot + per-frame dynamic layer
+## Frame capture: precomposed layers + per-frame dynamic roots
 
-`screen.js`'s compositor snapshots the DOM once at export start (media
-elements — canvas/video/img — plus one exception below) and only redraws
-per frame what's expected to change (highway canvases via
-`renderFrameAt`, dynamic text/lyrics). This is why export speed is
-independent of song duration but does depend on visualization cost and
-resolution.
+`screen.js`'s compositor classifies the player subtree once at export start:
+canvases and videos stay dynamic (renderFrameAt repaints them every frame),
+everything else that is not inside a lyrics/Staff View root is immutable and
+gets flattened into offscreen layers cut at every live node, so z-order is
+preserved. Layers are rebuilt while a referenced image/SVG is still decoding
+(`MAX_LAYER_BUILDS` bounds that retry loop) so late-loading art isn't missing
+from the whole export. Lyrics and Staff View roots are cached per root and
+invalidated by a `MutationObserver` on the player; their rects are re-measured
+every frame because panes scroll, while style-derived fields are only recomputed
+after a real change. Export speed is independent of song duration but does
+depend on visualization cost and resolution.
+
+**Don't flatten across live nodes.** Precomposing a run that contains a
+highway canvas is what the original implementation effectively did not do, and
+it is the whole reason runs are cut: a live canvas must be composited between
+the static pixels above and below it.
 
 **Known gap: Staff View (alphaTab) notation goes stale or never
 appears.** Staff View renders sheet music as `<svg>`, swapped out by
-alphaTab as playback scrolls to a new system. The one-time snapshot
-rasterizes each top-level `<svg>` **once, at export start** — see the
-comment at `screen.js:131-135` — so a Staff View export shows either
-nothing (if alphaTab hadn't rendered yet at snapshot time) or whatever was
-on screen at t=0, frozen, for the entire video. This is tracked as issue
-**#2** (open) with a candidate fix in PR **#4** (open, not yet merged as
-of this writing): exclude Staff View's container from the one-time
-snapshot and instead re-describe/re-rasterize it every composited frame
-(via a `WeakMap` cache keyed by element, so an unchanged SVG isn't
-re-encoded every frame), the same way the split-lyrics pane already
-handles its own per-timestamp DOM rebuilds. **Do not assume this is fixed
-without checking whether #4 has merged** — the bug reproduces against the
-`main` branch's current `screen.js` as of this file's writing.
+alphaTab as playback scrolls to a new system. Its container is excluded from
+the precomposed layers and re-described (and re-rasterized per element
+reference, via a `WeakMap` cache) instead, the same way the split-lyrics pane
+handles its own per-timestamp DOM rebuilds — so this behaviour is now shared
+with lyrics rather than special-cased, but the underlying issue is tracked as
+issue **#2**. Don't assume that bug is fixed without checking whether #4 has
+merged.
+
+## Encoder pipeline and transport
+
+The frame loop never calls `flush()` except once at the end. It applies
+backpressure from the encoder's `dequeue` event instead
+(`createEncodeBackpressure`, high/low watermarks) so rendering, compositing,
+and encoding stay pipelined. Hardware encoding is requested via
+`hardwareAcceleration: 'prefer-hardware'` first, with the previous
+configuration as the fallback. The progress UI reports elapsed time and
+realtime factor so changes are measurable — see issue #9.
+
+Encoded chunks go to a server-side export session (`/sessions`, streamed to
+`/sessions/{id}/video`) when those routes exist; the browser falls back to
+buffering everything and POSTing `/mux` when the host predates them or the
+audio source needs uploading. Session temp dirs are cleaned on cancel, on mux,
+and by a TTL sweep — keep all three paths.
 
 **Known non-goal:** Jumping Tab panes don't provide deterministic frame
 rendering and aren't supported in offline split exports (README's own
@@ -76,7 +96,7 @@ without a host-side contract for it first.
 ## Mount lifecycle
 
 `mountButton()` injects the "Export video" control into the v3 player
-chrome's Plugins rail. A `setInterval` poll (`screen.js:327`) exists only
+chrome's Plugins rail. A `setInterval` poll (`screen.js:711`) exists only
 to catch the slot not being ready yet at initial page load (a v3-chrome
 mount race); once the first successful mount happens, the poll stops
 itself and all future remounts are covered by the `screen:changed`

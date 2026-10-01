@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +42,42 @@ class RoutesTest(unittest.TestCase):
         self.assertIn((f"{base}/settings", "POST"), registered)
         self.assertIn((f"{base}/capabilities", "GET"), registered)
         self.assertIn((f"{base}/mux", "POST"), registered)
+        self.assertIn((f"{base}/sessions", "POST"), registered)
+        self.assertIn((f"{base}/sessions/{{session_id}}/video", "POST"), registered)
+        self.assertIn((f"{base}/sessions/{{session_id}}/audio", "POST"), registered)
+        self.assertIn((f"{base}/sessions/{{session_id}}/mux", "POST"), registered)
+        self.assertIn((f"{base}/sessions/{{session_id}}", "DELETE"), registered)
+
+
+class SameHostPathTest(unittest.TestCase):
+    def test_accepts_site_relative_paths(self):
+        self.assertEqual(routes._same_host_path("/songs/pack/full_mix.wav"), "/songs/pack/full_mix.wav")
+
+    def test_rejects_anything_that_could_leave_the_host(self):
+        for url in (
+            "https://elsewhere.example/song.wav",
+            "//elsewhere.example/song.wav",
+            "/../etc/passwd",
+            "songs/pack/full_mix.wav",
+            "/songs\\pack.wav",
+            "",
+            None,
+        ):
+            self.assertIsNone(routes._same_host_path(url), url)
+
+
+class ValidTimingTest(unittest.TestCase):
+    def test_accepts_supported_frame_rates(self):
+        self.assertTrue(routes._valid_timing(30, 180.0))
+        self.assertTrue(routes._valid_timing(24, 1))
+
+    def test_rejects_bad_values(self):
+        self.assertFalse(routes._valid_timing(25, 180.0))
+        self.assertFalse(routes._valid_timing(True, 180.0))
+        self.assertFalse(routes._valid_timing(30, 0))
+        self.assertFalse(routes._valid_timing(30, True))
+        self.assertFalse(routes._valid_timing(30, "180"))
+        self.assertFalse(routes._valid_timing(30, 9 * 60 * 60))
 
 
 def _client(tmp_path):
@@ -125,3 +163,290 @@ def test_mux_reports_ffmpeg_failure_and_removes_work_dir(tmp_path, monkeypatch):
     assert response.status_code == 500
     assert response.json() == {"error": "mux failure"}
     assert not work.exists()
+
+
+def _session(client, **payload):
+    body = {"fps": 30, "duration": 1.0, "filename": "song", **payload}
+    return client.post("/api/plugins/visual_export/sessions", json=body)
+
+
+def _stub_audio(monkeypatch, audio=b"audio"):
+    """Stand in for the host serving the song mix back over its own origin."""
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        assert str(request.full_url).endswith("/songs/pack/full_mix.wav")
+        assert timeout is not None
+        return _Response(audio)
+
+    monkeypatch.setattr(routes.urllib.request, "urlopen", fake_urlopen)
+
+
+def _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"audio"):
+    def fake_ffmpeg(cmd, **kwargs):
+        assert (work / "frames.h264").read_bytes() == video
+        assert (work / "audio.bin").read_bytes() == audio
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_ffmpeg)
+
+
+def test_session_streams_chunks_then_muxes_server_resolved_audio(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+    _stub_ffmpeg(monkeypatch, work, video=b"chunkone" + b"chunktwo")
+    client = _client(tmp_path)
+
+    created = _session(client, audio_url="/songs/pack/full_mix.wav")
+    assert created.status_code == 200
+    session = created.json()["session"]
+
+    for chunk in (b"chunkone", b"chunktwo"):
+        response = client.post(
+            f"/api/plugins/visual_export/sessions/{session}/video",
+            content=chunk,
+            headers={"Content-Type": "video/h264"},
+        )
+        assert response.status_code == 200
+    assert (work / "frames.h264").read_bytes() == b"chunkonechunktwo"
+
+    muxed = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux",
+        json={"fps": 30, "duration": 1.0, "filename": "song / export"},
+    )
+    assert muxed.status_code == 200
+    assert muxed.content == b"mp4"
+    assert 'filename="songexport.mp4"' in muxed.headers["content-disposition"]
+    assert not work.exists()
+
+    # A session is single-use: a second mux must not reuse the stale work dir.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux",
+        json={"fps": 30, "duration": 1.0, "filename": "song"},
+    ).status_code == 404
+
+
+def test_session_rejects_invalid_timing_before_creating_work_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+
+    def unexpected_work_dir(**kwargs):
+        raise AssertionError("invalid timing must not create a work directory")
+
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", unexpected_work_dir)
+    response = _client(tmp_path).post(
+        "/api/plugins/visual_export/sessions", json={"fps": 25, "duration": 1.0}
+    )
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid export timing"}
+
+
+def test_session_rejects_audio_url_that_is_not_same_host(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+
+    def unexpected_work_dir(**kwargs):
+        raise AssertionError("an off-host audio URL must not create a work directory")
+
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", unexpected_work_dir)
+    response = _session(_client(tmp_path), audio_url="https://elsewhere.example/song.wav")
+    assert response.status_code == 400
+    assert response.json() == {"error": "audio_url must be a same-host path"}
+
+
+def test_session_video_upload_enforces_size_limit(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 3)
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+
+    response = client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"four")
+    assert response.status_code == 400
+    assert "too large" in response.json()["error"]
+
+
+def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+
+    def fail_urlopen(request, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(routes.urllib.request, "urlopen", fail_urlopen)
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert response.status_code == 400
+    assert "connection refused" in response.json()["error"]
+    assert not work.exists()
+
+
+def test_session_mux_reports_ffmpeg_failure_and_removes_work_dir(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+    monkeypatch.setattr(
+        routes.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="session mux failure"),
+    )
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert response.status_code == 500
+    assert response.json() == {"error": "session mux failure"}
+    assert not work.exists()
+
+
+def test_session_audio_upload_muxes_without_server_side_fetch(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"uploaded mix")
+    client = _client(tmp_path)
+
+    session = _session(client).json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    uploaded = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/audio", content=b"uploaded mix"
+    )
+    assert uploaded.status_code == 200
+    # A second upload would silently replace the mix that was already muxed.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/audio", content=b"other"
+    ).status_code == 409
+
+    muxed = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert muxed.status_code == 200
+    assert muxed.content == b"mp4"
+    assert not work.exists()
+
+
+def test_session_mux_requires_audio(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client).json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert response.status_code == 400
+    assert "no song audio" in response.json()["error"]
+    assert not work.exists()
+
+
+def test_session_mux_requires_uploaded_video(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert response.status_code == 400
+    assert "no encoded video" in response.json()["error"]
+    assert not work.exists()
+
+
+def test_session_mux_rejects_invalid_timing_and_keeps_the_session(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+
+    response = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 25, "duration": 1.0}
+    )
+    assert response.status_code == 400
+    # A rejected request must not destroy the upload the browser already sent.
+    assert (work / "frames.h264").read_bytes() == b"video"
+    assert client.delete(f"/api/plugins/visual_export/sessions/{session}").status_code == 200
+
+
+def test_cancel_session_removes_work_dir_and_unknown_session_is_404(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    assert work.exists()
+
+    assert client.delete(f"/api/plugins/visual_export/sessions/{session}").status_code == 200
+    assert not work.exists()
+    assert client.delete(f"/api/plugins/visual_export/sessions/{session}").status_code == 404
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/video", content=b"video"
+    ).status_code == 404
+
+
+def test_abandoned_sessions_are_expired(tmp_path, monkeypatch):
+    work = tmp_path / "works"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "SESSION_TTL_SECONDS", 0)
+    counter = iter(range(100))
+
+    def fake_mkdtemp(**kwargs):
+        path = work / f"work{next(counter)}"
+        path.mkdir(parents=True)
+        return str(path)
+
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", fake_mkdtemp)
+    client = _client(tmp_path)
+    first = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{first}/video", content=b"video")
+
+    second = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    assert second != first
+    assert not (work / "work0").exists()
+    assert (work / "work1").exists()
+
+
+def test_session_limit_drops_the_oldest_session(tmp_path, monkeypatch):
+    work = tmp_path / "works"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_SESSIONS", 2)
+    counter = iter(range(100))
+
+    def fake_mkdtemp(**kwargs):
+        path = work / f"work{next(counter)}"
+        path.mkdir(parents=True)
+        return str(path)
+
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", fake_mkdtemp)
+    client = _client(tmp_path)
+    sessions = [_session(client).json()["session"] for _ in range(3)]
+    assert len(set(sessions)) == 3
+    assert not (work / "work0").exists()
+    assert (work / "work1").exists()
+    assert (work / "work2").exists()
