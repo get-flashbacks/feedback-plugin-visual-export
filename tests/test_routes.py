@@ -313,7 +313,6 @@ def test_session_rejects_audio_url_that_is_not_same_host(tmp_path, monkeypatch):
 
 
 def test_session_video_upload_enforces_size_limit_across_appends(tmp_path, monkeypatch):
-    work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 5)
     _isolated_work(tmp_path, monkeypatch)
