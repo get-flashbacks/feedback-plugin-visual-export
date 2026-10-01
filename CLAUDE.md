@@ -14,12 +14,12 @@ this file covers the parts an agent needs that the README doesn't.
   issue #102 for the org-wide core-compatibility audit (it tracks this
   dependency but deliberately does **not** pin a version for it; see the
   `minHost` bullet). The export also calls
-  `window.highway.getSongInfo()` (`screen.js:282`; `songInfo.full_mix_url`
+  `window.highway.getSongInfo()` (`screen.js:589`; `songInfo.full_mix_url`
   is the *preferred* audio source, falling back to `audio.currentSrc` /
-  `audio.src` / `window._juceAudioUrl` at `screen.js:290` — the whole
+  `audio.src` / `window._juceAudioUrl` at `screen.js:597` — the whole
   export only bails when all four are empty, so a host with no
   `getSongInfo` at all can still export via the `<audio>` element) and
-  `window.highway.getSections()` for HUD text (`screen.js:230`) — but both
+  `window.highway.getSections()` for HUD text (`screen.js:402`) — but both
   are long-standing core APIs in `get-flashbacks/feedBack`'s
   `static/highway.js`, present in all 35 commits back to its root commit
   `6c110398` (Jun 16), and are **not** part of the `f7c761c` floor (issue
@@ -77,14 +77,31 @@ this file covers the parts an agent needs that the README doesn't.
   absence surfaces from `routes.py` as a muxing failure (503) rather than as a
   host compatibility error.
 
-## Frame capture: static snapshot + per-frame dynamic layer
+## Frame capture: precomposed layers + per-frame dynamic roots
 
-`screen.js`'s compositor snapshots the DOM once at export start (media
-elements — canvas/video/img — plus one exception below) and only redraws
-per frame what's expected to change (highway canvases via
-`renderFrameAt`, dynamic text/lyrics). This is why export speed is
-independent of song duration but does depend on visualization cost and
-resolution.
+`screen.js`'s compositor classifies the player subtree once at export start:
+canvases and videos stay dynamic (renderFrameAt repaints them every frame),
+everything else that is not inside a lyrics/Staff View root is immutable and
+gets flattened into offscreen layers cut at every live node, so z-order is
+preserved. Layers are rebuilt while a referenced image/SVG is still decoding
+(`MAX_LAYER_BUILDS` bounds that retry loop) so late-loading art isn't missing
+from the whole export. Lyrics and Staff View roots are cached per root and
+invalidated by a `MutationObserver` on the player; their rects are re-measured
+every frame because panes scroll, while style-derived fields are only recomputed
+after a real change. Export speed is independent of song duration but does
+depend on visualization cost and resolution.
+
+**Don't flatten across live nodes.** Precomposing a run that contains a
+highway canvas is what the original implementation effectively did not do, and
+it is the whole reason runs are cut: a live canvas must be composited between
+the static pixels above and below it.
+
+**Layer bounds are snapshot-based, under the lock.** `video_bytes` is the
+file's size, so it may only be read *inside* `append_lock`. Snapshotting before
+the acquire gives every in-flight append the same stale base, each gets a full
+`MAX_VIDEO_BYTES` of headroom, and a rollback can truncate below the accepted
+prefix. A rejected append truncates back to that snapshot — never unlink, or a
+single over-limit chunk destroys the whole render.
 
 **Fixed: Staff View (alphaTab) notation no longer goes stale.** Staff View
 renders sheet music as `<svg>`, swapped out by alphaTab as playback scrolls to
@@ -98,6 +115,40 @@ per-timestamp DOM rebuilds. Issue #2 is closed (2026-09-28). Earlier revisions
 of this file listed this as an open gap and pointed at PR #4 as unmerged; that
 warning was left in place after the fix landed.
 
+## Encoder pipeline and transport
+
+The frame loop never calls `flush()` except once at the end. It applies
+backpressure from the encoder's `dequeue` event instead
+(`createEncodeBackpressure`, high/low watermarks) so rendering, compositing,
+and encoding stay pipelined. `dequeue` only exists from Chromium 106 while the
+`VideoEncoder`/`VideoFrame` capability gate is satisfied from 94, so
+`createEncodeBackpressure` probes `'ondequeue' in encoder` and polls faster
+when it is absent — don't assume the event exists. Hardware encoding is
+requested via `hardwareAcceleration: 'prefer-hardware'` first, with the
+previous configuration as the fallback. The progress UI reports elapsed time
+and realtime factor so changes are measurable — see issue #9.
+
+Encoded chunks go to a server-side export session (`/sessions`, streamed to
+`/sessions/{id}/video`) when those routes exist; the browser falls back to
+buffering everything and POSTing `/mux` when the host predates them or the
+audio source needs uploading. Session temp dirs are cleaned on cancel, on mux,
+and by a TTL sweep — keep all three paths.
+
+**Server-side audio resolution is opt-in and origin-pinned.** The browser only
+ever sends a site-relative `audio_url`, but that constrains the path, not the
+destination: `urlopen` follows cross-origin 30x, and `request.base_url` is built
+from the client-controlled `Host` header. So the origin comes from the
+`FEEDBACK_PUBLIC_ORIGIN` environment variable alone (`_expected_origin()`), and
+`_AUDIO_OPENER` refuses every redirect plus double-checks `response.geturl()`.
+
+The browser and server must agree on who supplies the audio, or every export
+fails at mux time *after* the whole render: `create_session` returns
+`audio_fetch` and `screen.js` only skips the upload when it is true. For the
+same reason, audio resolution happens **before** `mux_session` pops the session —
+a fetch failure answers 409 `audio_required` and keeps the session, so the
+browser can upload the mix and retry. Don't move either decision earlier or
+later. Don't "simplify" the origin by reading it off the request.
+
 **Known non-goal:** Jumping Tab panes don't provide deterministic frame
 rendering and aren't supported in offline split exports (README's own
 "Limits" section) — this is a stated limitation, not a bug to fix here
@@ -106,7 +157,7 @@ without a host-side contract for it first.
 ## Mount lifecycle
 
 `mountButton()` injects the "Export video" control into the v3 player
-chrome's Plugins rail. A `setInterval` poll (`screen.js:391`) exists only
+chrome's Plugins rail. A `setInterval` poll (`screen.js:789`) exists only
 to catch the slot not being ready yet at initial page load (a v3-chrome
 mount race); once the first successful mount happens, the poll stops
 itself and all future remounts are covered by the `screen:changed`
