@@ -27,11 +27,21 @@ function block(signature) {
     return source.slice(start, end);
 }
 
+// `SPLIT_BRIDGE` is a statement, not a braced block: slice to the terminating
+// semicolon so the extraction cannot run past it into the function below.
+function statement(signature) {
+    const start = source.indexOf(signature);
+    assert.ok(start >= 0, `missing ${signature}`);
+    const end = source.indexOf(';', start);
+    assert.ok(end > start, `${signature} must be terminated`);
+    return source.slice(start, end + 1);
+}
+
 // Build a frameDriverProblem bound to a stub host. `highway` stands in for the
 // feedBack core global; the split object stands in for whichever Splitscreen
 // global the plugin picked up.
 function gateFor(highway) {
-    const constant = block("const SPLIT_BRIDGE =");
+    const constant = statement("const SPLIT_BRIDGE =");
     const fn = block('function frameDriverProblem(');
     return new Function('window', `${constant}\n${fn}\nreturn frameDriverProblem;`)(
         { highway }

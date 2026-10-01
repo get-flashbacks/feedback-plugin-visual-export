@@ -14,9 +14,9 @@ this file covers the parts an agent needs that the README doesn't.
   issue #102 for the org-wide core-compatibility audit (it tracks this
   dependency but deliberately does **not** pin a version for it; see the
   `minHost` bullet). The export also calls
-  `window.highway.getSongInfo()` (`screen.js:281`; `songInfo.full_mix_url`
+  `window.highway.getSongInfo()` (`screen.js:282`; `songInfo.full_mix_url`
   is the *preferred* audio source, falling back to `audio.currentSrc` /
-  `audio.src` / `window._juceAudioUrl` at `screen.js:289` — the whole
+  `audio.src` / `window._juceAudioUrl` at `screen.js:290` — the whole
   export only bails when all four are empty, so a host with no
   `getSongInfo` at all can still export via the `<audio>` element) and
   `window.highway.getSections()` for HUD text (`screen.js:230`) — but both
@@ -106,7 +106,7 @@ without a host-side contract for it first.
 ## Mount lifecycle
 
 `mountButton()` injects the "Export video" control into the v3 player
-chrome's Plugins rail. A `setInterval` poll (`screen.js:390`) exists only
+chrome's Plugins rail. A `setInterval` poll (`screen.js:391`) exists only
 to catch the slot not being ready yet at initial page load (a v3-chrome
 mount race); once the first successful mount happens, the poll stops
 itself and all future remounts are covered by the `screen:changed`
