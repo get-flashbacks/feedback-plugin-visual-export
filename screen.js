@@ -121,7 +121,12 @@
     const ox = (target.width - pr.width * scale) / 2;
     const oy = (target.height - pr.height * scale) / 2;
     const ps = getComputedStyle(player);
-    const skipChrome = el => !includeChrome && !!el.closest('#player-controls,#player-footer,#v3-railzone,[id^="v3-rail-pop-"]');
+    // #player-hud is the host's own top overlay (song metadata, clock, Up Next).
+    // Its chrome-hide list in static/v3/index.html excludes it too, and it is a
+    // sibling of #player-controls under #player, so nothing else here would catch
+    // it. Left in, its live text would be baked into a precomposed layer at
+    // export start and the video would carry a clock frozen at t=0.
+    const skipChrome = el => !includeChrome && !!el.closest('#player-hud,#player-controls,#player-footer,#v3-railzone,[id^="v3-rail-pop-"]');
     const lyricSelector = '.splitscreen-lyrics-pane,.splitscreen-lyrics-overlay';
     // Staff View (alphaTab) swaps its rendered SVG(s) out from under us as
     // playback scrolls to a new system — a one-time snapshot captures
@@ -383,16 +388,12 @@
     const timelineClock = document.getElementById('hud-time');
     const timelineName = document.getElementById('v3-upnext-name');
     const timelineEta = document.getElementById('v3-upnext-eta');
-    // The HUD is captured only if it survives skipChrome, and it currently
-    // does: in the host's v3 shell #player-hud is a sibling of
-    // #player-controls under #player, so `captured()` is true and these writes
-    // still happen every frame, exactly as before this change. The guard is
-    // what keeps that correct if the HUD is ever added to skipChrome (the
-    // host's own chrome-hide list in static/v3/index.html already excludes
-    // #player-hud) -- writing text into chrome that is not captured would only
-    // cost layout and style invalidations. Do not "optimize" this by dropping
-    // the guard: removing #player-hud from exports is a user-visible output
-    // change, not a performance fix.
+    // The HUD is in skipChrome, so these writes can never reach the video: the
+    // clock and Up Next line are static text baked into a precomposed layer at
+    // export start, and updating them in the DOM only costs layout and style
+    // invalidations on the host page. Keep the guard in step with skipChrome —
+    // if the HUD is ever un-excluded (see the note on skipChrome above), these
+    // writes become load-bearing again.
     const captured = el => !!el && !skipChrome(el);
 
     function updateTimeline(t, duration) {

@@ -38,6 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their descriptors are now cached and invalidated from a mutation observer on
   the affected subtree rather than re-queried every frame.
 - The HUD timeline text is only written while the chrome displaying it is
-  captured. In the host's current v3 shell `#player-hud` is a sibling of
-  `#player-controls`, so it is captured and these writes still happen every
-  frame; the guard is what keeps them correct if the HUD is ever excluded.
+  captured. The `#player-hud` overlay is excluded from capture alongside the
+  controls, so those updates no longer reach exported frames. The guard stays
+  in step with the capture list in case this changes.
