@@ -62,6 +62,12 @@ highway canvas is what the original implementation effectively did not do, and
 it is the whole reason runs are cut: a live canvas must be composited between
 the static pixels above and below it.
 
+**Layer bounds are snapshot-based.** A rejected `/video` append truncates the
+file back to `state["video_bytes"]`, the pre-request size — never unlink it, or
+a single over-limit chunk destroys the whole render, and never "refund" the
+counter by the rejected body size, which drives it negative and stops
+`MAX_VIDEO_BYTES` binding.
+
 **Known gap: Staff View (alphaTab) notation goes stale or never
 appears.** Staff View renders sheet music as `<svg>`, swapped out by
 alphaTab as playback scrolls to a new system. Its container is excluded from
@@ -97,9 +103,14 @@ destination: `urlopen` follows cross-origin 30x, and `request.base_url` is built
 from the client-controlled `Host` header. So the origin comes from the
 `FEEDBACK_PUBLIC_ORIGIN` environment variable alone (`_expected_origin()`), and
 `_AUDIO_OPENER` refuses every redirect plus double-checks `response.geturl()`.
-Unset the variable, or give a mix the server can't fetch, and the browser
-uploads the audio instead — that path must keep working. Don't "simplify" this
-by reading the origin off the request.
+
+The browser and server must agree on who supplies the audio, or every export
+fails at mux time *after* the whole render: `create_session` returns
+`audio_fetch` and `screen.js` only skips the upload when it is true. For the
+same reason, audio resolution happens **before** `mux_session` pops the session —
+a fetch failure answers 409 `audio_required` and keeps the session, so the
+browser can upload the mix and retry. Don't move either decision earlier or
+later. Don't "simplify" the origin by reading it off the request.
 
 **Known non-goal:** Jumping Tab panes don't provide deterministic frame
 rendering and aren't supported in offline split exports (README's own

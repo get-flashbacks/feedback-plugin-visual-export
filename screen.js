@@ -523,6 +523,11 @@
     return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   }
 
+  // Returns the session id, or null when the host has no session routes.
+  // `audioFetch` mirrors the server's own ability to resolve the song mix:
+  // the server can only fetch it when it has a configured public origin, so
+  // gating on `sameOrigin` alone left the browser skipping the upload and the
+  // mux then failing at the very end of a full render.
   async function openExportSession(payload) {
     try {
       const response = await fetch(`/api/plugins/${PLUGIN_ID}/sessions`, {
@@ -530,7 +535,8 @@
       });
       if (!response.ok) return null;
       const data = await response.json();
-      return data && typeof data.session === 'string' ? data.session : null;
+      if (!data || typeof data.session !== 'string') return null;
+      return { id: data.session, audioFetch: data.audio_fetch !== false };
     } catch (_) { return null; }
   }
 
@@ -600,12 +606,13 @@
       if (splitActive) split.beginOfflineRender?.();
       compositor = await createCompositor(output, includeChrome);
 
-      // Issue #9, phase 3: when the host serves the song mix from its own
-      // origin the server can fetch it directly, so the browser skips the
-      // full audio download and re-upload entirely. Anything else (a remote
-      // host, a blob: URL) is uploaded once into the session, and an older
-      // host without session routes falls back to the single-request mux
-      // endpoint with the whole elementary stream kept in memory.
+      // Issue #9, phase 3: when the host serves the song mix from its own origin
+      // AND the server is configured to resolve it, the server fetches the
+      // mix directly and the browser skips the full audio download and
+      // re-upload entirely. Every other combination -- a remote host, a blob:
+      // URL, or a server with no configured public origin -- uploads the audio
+      // once into the session, and a host with no session routes at all falls
+      // back to buffering everything and POSTing /mux.
       let audioBlob = null;
       let serverAudio = null;
       const sameOrigin = (() => {
@@ -616,21 +623,27 @@
         const resolved = new URL(audioUrl, location.href);
         serverAudio = resolved.pathname + resolved.search;
       }
-      session = await openExportSession(
+      const opened = await openExportSession(
         serverAudio ? { ...payload, audio_url: serverAudio } : payload
       );
-      if (!session || !serverAudio) {
-        status(dialog, 'Loading source audio…', 0);
+      session = opened ? opened.id : null;
+      // Only trust server-side resolution when the server said it can do it.
+      const serverWillFetch = !!opened && opened.audioFetch && !!serverAudio;
+      if (serverWillFetch) serverAudio = null;
+      const uploadAudio = async () => {
         const audioResponse = await fetch(audioUrl);
         if (!audioResponse.ok) throw new Error(`Could not load song audio (HTTP ${audioResponse.status}).`);
-        audioBlob = await audioResponse.blob();
-        if (session) {
-          const upload = await fetch(`/api/plugins/${PLUGIN_ID}/sessions/${encodeURIComponent(session)}/audio`, {
-            method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: audioBlob
-          });
-          if (!upload.ok) throw new Error(`Audio upload failed (HTTP ${upload.status}).`);
-          audioBlob = null;
-        }
+        const blob = await audioResponse.blob();
+        if (!session) return blob;
+        const upload = await fetch(`/api/plugins/${PLUGIN_ID}/sessions/${encodeURIComponent(session)}/audio`, {
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: blob
+        });
+        if (!upload.ok) throw new Error(`Audio upload failed (HTTP ${upload.status}).`);
+        return null;
+      };
+      if (!serverWillFetch) {
+        status(dialog, 'Loading source audio…', 0);
+        audioBlob = await uploadAudio();
       }
       const profile = await encoderConfig(width, height, fps, Math.round(bitrateMbps * 1e6));
       let encodeError = null;
@@ -688,10 +701,24 @@
       status(dialog, 'Muxing video and audio…', 0.94);
       let mux;
       if (session) {
-        mux = await fetch(`/api/plugins/${PLUGIN_ID}/sessions/${encodeURIComponent(session)}/mux`, {
+        const muxSession = (audioUrl) => fetch(`/api/plugins/${PLUGIN_ID}/sessions/${encodeURIComponent(session)}/mux`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...payload, audio_url: serverAudio })
+          body: JSON.stringify({ ...payload, audio_url: audioUrl })
         });
+        mux = await muxSession(serverAudio);
+        // The server kept the session alive and asked for the mix when it
+        // cannot resolve it itself (no configured origin, or the fetch failed).
+        // The browser already has the audio, so upload it and ask again rather
+        // than discarding a finished render.
+        if (mux.status === 409) {
+          const detail = await mux.json().catch(() => ({}));
+          if (detail.audio_required) {
+            status(dialog, 'Sending source audio to the server…', 0.96);
+            audioBlob = await uploadAudio();
+            serverAudio = null;
+            mux = await muxSession(null);
+          }
+        }
       } else {
         const form = new FormData();
         form.append('video', sink.blob(), 'frames.h264');

@@ -298,7 +298,7 @@ def setup(app: FastAPI, context: dict) -> None:
             # can never interleave writes into the same elementary stream.
             "append_lock": asyncio.Lock(),
         }
-        return JSONResponse({"session": session_id})
+        return JSONResponse({"session": session_id, "audio_fetch": sessions[session_id]["origin"] is not None})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/video")
     async def append_session_video(session_id: str, request: Request) -> JSONResponse:
@@ -308,6 +308,10 @@ def setup(app: FastAPI, context: dict) -> None:
         state["touched"] = time.monotonic()
         video_path = state["work"] / "frames.h264"
         total = 0
+        # Snapshot the counter before the request: it is the file's size, so it
+        # must be restored to exactly this value on failure rather than adjusted
+        # by whatever this request happened to receive.
+        start = state["video_bytes"]
         try:
             async with state["append_lock"]:
                 with video_path.open("ab") as target:
@@ -316,16 +320,24 @@ def setup(app: FastAPI, context: dict) -> None:
                             continue
                         total += len(chunk)
                         # Running total, not this request's total: streaming must
-                        # not turn the old whole-upload cap into a per-chunk one.
-                        if state["video_bytes"] + total > MAX_VIDEO_BYTES:
+                        # not turn the old whole-upload cap into a per-request one.
+                        if start + total > MAX_VIDEO_BYTES:
                             raise ValueError("encoded video is too large")
                         target.write(chunk)
-                state["video_bytes"] += total
+                state["video_bytes"] = start + total
         except (OSError, ValueError) as exc:
-            # Don't leave a partial stream behind for a later mux to pick up.
+            # Roll back to the pre-request size: drop only this request's bytes,
+            # keeping the chunks already accepted, and leave the counter equal
+            # to the file's real size.
+            state["video_bytes"] = start
             if total:
-                state["video_bytes"] -= total
-                video_path.unlink(missing_ok=True)
+                try:
+                    os.truncate(video_path, start)
+                except OSError:
+                    # The file is unusable anyway; drop it rather than leave a
+                    # partial stream for a later mux to pick up.
+                    state["video_bytes"] = 0
+                    video_path.unlink(missing_ok=True)
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"bytes": total})
 
@@ -366,29 +378,36 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": "invalid session request"}, status_code=400)
         if not _valid_timing(data.get("fps"), data.get("duration")):
             return JSONResponse({"error": "invalid export timing"}, status_code=400)
-        # Pop the session first: every exit path below is responsible for
-        # removing its temporary directory, and a mux must not be repeatable.
         work = state["work"]
-        sessions.pop(session_id, None)
         video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
-        try:
-            if not video_path.is_file() or video_path.stat().st_size == 0:
-                raise ValueError("no encoded video was uploaded for this session")
-            audio_url = data.get("audio_url", state["audio_url"])
-            origin = state["origin"]
-            if audio_url is None or origin is None:
-                if audio_path.is_file():
-                    # The browser uploaded the mix itself (an audio source the
-                    # server cannot resolve on its own, or a host with no
-                    # configured public origin to fetch from).
-                    pass
-                else:
-                    raise ValueError("no song audio was recorded for this session")
-            else:
-                relative = _same_host_path(audio_url)
-                if relative is None:
-                    raise ValueError("audio_url must be a same-host path")
+        if not video_path.is_file() or video_path.stat().st_size == 0:
+            return JSONResponse({"error": "no encoded video was uploaded for this session"}, status_code=400)
+
+        # Resolve the audio BEFORE consuming the session. A mix the server
+        # cannot fetch (no configured origin, a 404, an auth wall, or any
+        # redirect now refused) leaves the session intact so the browser can
+        # upload the audio and ask again, instead of losing a full render at
+        # the last step.
+        audio_url = data.get("audio_url", state["audio_url"])
+        origin = state["origin"]
+        if not audio_path.is_file():
+            relative = _same_host_path(audio_url) if audio_url is not None else None
+            if audio_url is not None and origin is not None and relative is None:
+                return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
+            if relative is None or origin is None:
+                return JSONResponse({"error": "no song audio was recorded for this session",
+                                     "audio_required": True}, status_code=409)
+            try:
                 await _fetch_host_audio(origin, relative, audio_path)
+            except (OSError, ValueError, urllib.error.URLError) as exc:
+                audio_path.unlink(missing_ok=True)
+                log.warning("%s: could not fetch song audio, asking the browser to upload it: %s", PLUGIN_ID, exc)
+                return JSONResponse({"error": str(exc), "audio_required": True}, status_code=409)
+
+        # Past this point the session is consumed: every exit path below removes
+        # its temporary directory, and a mux must not be repeatable.
+        sessions.pop(session_id, None)
+        try:
             proc = await asyncio.to_thread(
                 _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
             )

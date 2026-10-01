@@ -86,6 +86,19 @@ def _client(tmp_path):
     return TestClient(app)
 
 
+def _isolated_work(tmp_path, monkeypatch):
+    """Point session temp dirs at tmp_path, one fresh dir per session."""
+    counter = [0]
+
+    def mkdtemp(**kwargs):
+        counter[0] += 1
+        path = tmp_path / f"work{counter[0]}"
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", mkdtemp)
+
+
 def _export(client, *, fps="30", video=b"video", audio=b"audio", filename="song"):
     return client.post(
         "/api/plugins/visual_export/mux",
@@ -303,27 +316,67 @@ def test_session_video_upload_enforces_size_limit_across_appends(tmp_path, monke
     work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 5)
-    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _isolated_work(tmp_path, monkeypatch)
     client = _client(tmp_path)
     session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    video = tmp_path / "work1" / "frames.h264"
 
     # Each append is under the limit on its own; the session total must still be
     # capped, or streaming silently removes the bound the old upload had.
     assert client.post(
         f"/api/plugins/visual_export/sessions/{session}/video", content=b"three"
     ).status_code == 200
+    assert video.read_bytes() == b"three"
     response = client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"four")
     assert response.status_code == 400
     assert "too large" in response.json()["error"]
-    # A rejected append must not leave a partial stream for a later mux.
-    assert not (work / "frames.h264").exists()
+    # Only the rejected request's bytes are rolled back, so the chunks already
+    # accepted survive...
+    assert video.read_bytes() == b"three"
+    # ...and the counter is still the file's size, so a further append that
+    # would fit is refused too. A refund smaller than the rejected body (or a
+    # counter driven negative) would let this through.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/video", content=b"two"
+    ).status_code == 400
+    assert video.read_bytes() == b"three"
+
+    # An oversized first append truncates to nothing rather than leaving a tail.
+    second = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{second}/video", content=b"0123456789"
+    ).status_code == 400
+    assert (tmp_path / "work2" / "frames.h264").read_bytes() == b""
+
+
+def test_rejected_append_keeps_earlier_chunks_and_the_cap(tmp_path, monkeypatch):
+    """A rejected append must not delete the chunks already streamed."""
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 5)
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+    _stub_ffmpeg(monkeypatch, work, video=b"12345")
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    url = f"/api/plugins/visual_export/sessions/{session}/video"
+
+    assert client.post(url, content=b"12345").status_code == 200
+    assert client.post(url, content=b"0123456789").status_code == 400
+    assert (work / "frames.h264").read_bytes() == b"12345"
+    assert client.post(url, content=b"x").status_code == 400
+    # The 5 accepted bytes are still muxable, which is the point of truncating
+    # rather than unlinking.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    ).status_code == 200
 
 
 def test_audio_fetch_requires_a_configured_origin(tmp_path, monkeypatch):
     """A client-supplied Host header must not be able to aim the fetch.
 
     _expected_origin() is the only source of the origin the audio fetch uses;
-    without one configured the server leaves the audio for the browser to send.
+    without one configured the server asks the browser for the mix instead.
     """
     work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
@@ -331,19 +384,41 @@ def test_audio_fetch_requires_a_configured_origin(tmp_path, monkeypatch):
     monkeypatch.delenv("FEEDBACK_PUBLIC_ORIGIN", raising=False)
     _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"uploaded mix")
     client = _client(tmp_path)
-    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    created = _session(client, audio_url="/songs/pack/full_mix.wav").json()
+    session = created["session"]
+    # The browser is told up front that the server will not resolve the mix, so
+    # it uploads the audio before rendering instead of failing at mux time.
+    assert created["audio_fetch"] is False
     client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
 
-    # Even with an attacker-chosen Host, nothing is fetched server-side, so the
-    # mux asks for the uploaded audio instead.
-    response = client.post(
+    # Even with an attacker-chosen Host, nothing is fetched server-side.
+    first = client.post(
         f"/api/plugins/visual_export/sessions/{session}/mux",
-        json={"fps": 30, "duration": 1.0},
+        json={"fps": 30, "duration": 1.0, "audio_url": "/songs/pack/full_mix.wav"},
         headers={"Host": "attacker.example"},
     )
-    assert response.status_code == 400
-    assert "no song audio" in response.json()["error"]
+    assert first.status_code == 409
+    assert first.json()["audio_required"] is True
+
+    # The session survives so the browser can upload and ask again.
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/audio", content=b"uploaded mix"
+    ).status_code == 200
+    second = client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    )
+    assert second.status_code == 200
+    assert second.content == b"mp4"
     assert not work.exists()
+
+
+def test_session_advertises_audio_fetch_only_when_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    _isolated_work(tmp_path, monkeypatch)
+    monkeypatch.delenv("FEEDBACK_PUBLIC_ORIGIN", raising=False)
+    assert _session(_client(tmp_path)).json()["audio_fetch"] is False
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
+    assert _session(_client(tmp_path)).json()["audio_fetch"] is True
 
 
 def test_expected_origin_ignores_unusable_configuration(monkeypatch):
@@ -356,11 +431,11 @@ def test_expected_origin_ignores_unusable_configuration(monkeypatch):
     assert routes._expected_origin() == "https://feedback.example"
 
 
-def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, monkeypatch):
+def test_session_mux_reports_audio_fetch_failure_and_keeps_the_session(tmp_path, monkeypatch):
+    """A fetch that fails mid-mux must not discard the rendered video."""
     work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
-
     monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
 
     class _Failing:
@@ -368,6 +443,7 @@ def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, 
             raise OSError("connection refused")
 
     monkeypatch.setattr(routes, "_AUDIO_OPENER", _Failing())
+    _stub_ffmpeg(monkeypatch, work, audio=b"audio")
     client = _client(tmp_path)
     session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
     client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
@@ -375,8 +451,19 @@ def test_session_mux_reports_audio_fetch_failure_and_removes_work_dir(tmp_path, 
     response = client.post(
         f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
     )
-    assert response.status_code == 400
+    assert response.status_code == 409
     assert "connection refused" in response.json()["error"]
+    assert response.json()["audio_required"] is True
+    # The half of a fetch that failed left nothing behind, and the session is
+    # intact so the browser can upload the mix and ask again.
+    assert not (work / "audio.bin").exists()
+    assert (work / "frames.h264").exists()
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/audio", content=b"audio"
+    ).status_code == 200
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    ).status_code == 200
     assert not work.exists()
 
 
@@ -429,9 +516,11 @@ def test_session_audio_upload_muxes_without_server_side_fetch(tmp_path, monkeypa
 
 
 def test_session_mux_requires_audio(tmp_path, monkeypatch):
+    """A mix the server cannot resolve keeps the session alive for an upload."""
     work = tmp_path / "work"
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"late mix")
     client = _client(tmp_path)
     session = _session(client).json()["session"]
     client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
@@ -439,9 +528,31 @@ def test_session_mux_requires_audio(tmp_path, monkeypatch):
     response = client.post(
         f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
     )
-    assert response.status_code == 400
-    assert "no song audio" in response.json()["error"]
+    assert response.status_code == 409
+    assert response.json()["audio_required"] is True
+    # The rendered video survives the refusal rather than being discarded.
+    assert (work / "frames.h264").read_bytes() == b"video"
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/audio", content=b"late mix"
+    ).status_code == 200
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    ).status_code == 200
     assert not work.exists()
+
+
+def test_session_mux_rejects_a_second_mux_after_success(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+    _stub_ffmpeg(monkeypatch, work)
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    body = {"fps": 30, "duration": 1.0}
+    assert client.post(f"/api/plugins/visual_export/sessions/{session}/mux", json=body).status_code == 200
+    assert client.post(f"/api/plugins/visual_export/sessions/{session}/mux", json=body).status_code == 404
 
 
 def test_session_mux_requires_uploaded_video(tmp_path, monkeypatch):
@@ -449,6 +560,7 @@ def test_session_mux_requires_uploaded_video(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
     monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
     _stub_audio(monkeypatch)
+    _stub_ffmpeg(monkeypatch, work)
     client = _client(tmp_path)
     session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
 
@@ -457,6 +569,12 @@ def test_session_mux_requires_uploaded_video(tmp_path, monkeypatch):
     )
     assert response.status_code == 400
     assert "no encoded video" in response.json()["error"]
+    # Nothing was rendered yet, so the session is kept and the browser can
+    # stream the video and ask again.
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    ).status_code == 200
     assert not work.exists()
 
 

@@ -19,10 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately, and abandoned sessions are expired server-side.
 - Set `FEEDBACK_PUBLIC_ORIGIN` (for example `http://127.0.0.1:5173`) to let the
   server fetch a same-host song mix itself, so the browser no longer downloads
-  and re-uploads it. Without it, or for a mix the server cannot fetch, the
-  browser uploads the audio once to the session as before. The fetch refuses
-  redirects and only ever contacts that configured origin — the `Host` header
-  is not trusted to choose it.
+  and re-uploads it. The server tells the browser whether it can resolve the
+  mix, and the browser only skips the upload when it can — without the variable
+  the audio is uploaded once to the session exactly as before. A fetch that
+  fails anyway (no configured origin, a 404, an auth wall, or any redirect,
+  which is refused) keeps the session alive so the browser can upload the mix
+  and retry the mux, rather than discarding a finished render. The fetch never
+  contacts a host other than the configured one — the `Host` header is not
+  trusted to choose it.
 
 ### Changed
 
@@ -37,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canvases, videos, lyrics, and Staff View are still painted per frame, and
   their descriptors are now cached and invalidated from a mutation observer on
   the affected subtree rather than re-queried every frame.
-- The HUD timeline text is only written while the chrome displaying it is
-  captured. The `#player-hud` overlay is excluded from capture alongside the
-  controls, so those updates no longer reach exported frames. The guard stays
-  in step with the capture list in case this changes.
+- The `#player-hud` overlay (song metadata, clock, Up Next) is now excluded from
+  capture, matching the host's own chrome-hide list. Its text is static for the
+  whole export, so leaving it captured would have baked a clock frozen at t=0
+  into every precomposed layer. **Exported videos no longer show the song
+  metadata, clock or Up Next line.**

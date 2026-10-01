@@ -43,10 +43,15 @@ encoder that produced it.
 ### Optional: let the server fetch the song audio
 
 Setting `FEEDBACK_PUBLIC_ORIGIN` to this host's own origin (for example
-`http://127.0.0.1:5173`) lets the plugin server fetch the song mix directly,
-so the browser skips downloading and re-uploading it. Unset — the default — or
-for a mix the server cannot fetch, the browser uploads the audio once to the
-export session instead; nothing else changes.
+`http://127.0.0.1:5173`) lets the plugin server fetch the song mix directly, so
+the browser skips downloading and re-uploading it. The server reports back
+whether it can do that, so the browser only skips the upload when it can — with
+the variable unset (the default), the audio is uploaded once to the export
+session as before, and nothing changes.
+
+If the server is configured but the fetch fails (a 404, an auth wall, or a
+redirect, which it refuses), the export is not thrown away: the session is kept
+alive, the browser uploads the mix, and the mux is retried.
 
 The server only ever contacts that configured origin, and it refuses redirects,
 so a song URL cannot redirect the fetch to another host.
