@@ -215,20 +215,48 @@ def setup(app: FastAPI, context: dict) -> None:
     # fallback for hosts or sources that cannot use a session.
     sessions: dict[str, dict] = {}
 
-    def _drop_session(session_id: str) -> None:
-        state = sessions.pop(session_id, None)
-        if state:
+    async def _drop_session(session_id: str) -> None:
+        """Retire a session and delete its work files under its lifecycle lock.
+
+        Every operation that touches a session's work dir holds that session's
+        lock, so waiting for it here is what stops cancel and eviction from
+        deleting a directory out from under an active upload, mux, or audio
+        fetch. The membership re-check matters because a caller may have read
+        the session before an earlier operation consumed it while we waited.
+        """
+        state = sessions.get(session_id)
+        if state is None:
+            return
+        async with state["lock"]:
+            if sessions.get(session_id) is not state:
+                return
+            sessions.pop(session_id, None)
             shutil.rmtree(state["work"], ignore_errors=True)
 
-    def _sweep_sessions() -> None:
+    async def _sweep_sessions() -> None:
         now = time.monotonic()
         for session_id, state in list(sessions.items()):
+            # A locked session has an operation in flight, so its files are in
+            # use: skip it rather than delete underneath it. It stays a
+            # candidate for the next sweep, once it has gone idle. A client that
+            # holds an upload open without ever finishing it (rather than
+            # disconnecting, which the upload's own cleanup handles) therefore
+            # pins that one session; deleting in-use files is the worse failure,
+            # so this wait is deliberate.
+            if state["lock"].locked():
+                continue
             if now - state["touched"] > SESSION_TTL_SECONDS:
                 log.info("%s: expiring abandoned export session %s", PLUGIN_ID, session_id)
-                _drop_session(session_id)
+                await _drop_session(session_id)
+        # Best-effort cap: it can only evict idle sessions, so a burst of
+        # simultaneously locked sessions can briefly exceed MAX_SESSIONS until
+        # they go idle and the next create sweeps them.
         while len(sessions) >= MAX_SESSIONS:
-            oldest = min(sessions, key=lambda key: sessions[key]["touched"])
-            _drop_session(oldest)
+            idle = [key for key, state in sessions.items() if not state["lock"].locked()]
+            if not idle:
+                break
+            oldest = min(idle, key=lambda key: sessions[key]["touched"])
+            await _drop_session(oldest)
 
     async def _json_body(request: Request) -> dict | None:
         raw = await request.body()
@@ -284,7 +312,7 @@ def setup(app: FastAPI, context: dict) -> None:
         audio_url = data.get("audio_url")
         if audio_url is not None and _same_host_path(audio_url) is None:
             return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
-        _sweep_sessions()
+        await _sweep_sessions()
         session_id = uuid.uuid4().hex
         sessions[session_id] = {
             "work": Path(tempfile.mkdtemp(prefix="feedback-visual-export-")),
@@ -294,9 +322,13 @@ def setup(app: FastAPI, context: dict) -> None:
             # Cumulative across every append, so the session as a whole is
             # bounded by MAX_VIDEO_BYTES the way the single-request upload was.
             "video_bytes": 0,
-            # Serializes concurrent chunk appends so two overlapping requests
-            # can never interleave writes into the same elementary stream.
-            "append_lock": asyncio.Lock(),
+            # One lifecycle lock per session, held for the whole of every
+            # operation that touches its work dir: video/audio appends, mux,
+            # cancel and eviction. It is what makes mux wait for an upload to
+            # finish (so FFmpeg only ever reads finalized media), admits a
+            # single mux owner, and keeps cancel/eviction from deleting files an
+            # operation still has open.
+            "lock": asyncio.Lock(),
         }
         return JSONResponse({"session": session_id,
                              # Only true when this session can actually resolve a
@@ -312,7 +344,15 @@ def setup(app: FastAPI, context: dict) -> None:
         video_path = state["work"] / "frames.h264"
         total = 0
         try:
-            async with state["append_lock"]:
+            # Hold the lifecycle lock for the whole append. It is the same lock
+            # mux, cancel and eviction take, which is the point: FFmpeg can only
+            # start once every in-flight append has finished, and a cancel or
+            # eviction cannot delete frames.h264 while it is being written.
+            async with state["lock"]:
+                # Re-check under the lock: the session may have been consumed or
+                # evicted while this request waited for it.
+                if sessions.get(session_id) is not state:
+                    return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
                 # Snapshot under the lock. Reading it before would let every
                 # in-flight append take the same pre-lock base, so each would
                 # get a full MAX_VIDEO_BYTES of headroom, the cap would bind at
@@ -363,28 +403,36 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
         state["touched"] = time.monotonic()
         audio_path = state["work"] / "audio.bin"
-        if audio_path.exists():
-            return JSONResponse({"error": "audio was already uploaded for this session"}, status_code=409)
         total = 0
         try:
-            with audio_path.open("wb") as target:
-                async for chunk in request.stream():
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > MAX_AUDIO_BYTES:
-                        raise ValueError("song audio is too large")
-                    target.write(chunk)
+            async with state["lock"]:
+                if sessions.get(session_id) is not state:
+                    return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+                # "Exists" means "fully uploaded": an in-progress upload holds
+                # the lock, so a concurrent mux or a second upload can never
+                # observe the file before it is complete.
+                if audio_path.exists():
+                    return JSONResponse({"error": "audio was already uploaded for this session"}, status_code=409)
+                try:
+                    with audio_path.open("wb") as target:
+                        async for chunk in request.stream():
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > MAX_AUDIO_BYTES:
+                                raise ValueError("song audio is too large")
+                            target.write(chunk)
+                except BaseException:
+                    # A client disconnect (ClientDisconnect) or task
+                    # cancellation (CancelledError) bypasses the handler below.
+                    # Remove the incomplete mix while still holding the lock, so
+                    # no mux can see it as complete, and on every unsuccessful
+                    # exit so a retry is not refused with 409 for a file that
+                    # was never finished. Re-raising preserves cancellation.
+                    audio_path.unlink(missing_ok=True)
+                    raise
         except (OSError, ValueError) as exc:
-            audio_path.unlink(missing_ok=True)
             return JSONResponse({"error": str(exc)}, status_code=400)
-        except BaseException:
-            # A client disconnect or task cancellation bypasses the handler
-            # above. Remove the incomplete mix on every unsuccessful exit so a
-            # retry is not refused with 409 for a file that was never finished,
-            # then re-raise to preserve cancellation.
-            audio_path.unlink(missing_ok=True)
-            raise
         return JSONResponse({"bytes": total})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/mux")
@@ -400,62 +448,82 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": "invalid session request"}, status_code=400)
         if not _valid_timing(data.get("fps"), data.get("duration")):
             return JSONResponse({"error": "invalid export timing"}, status_code=400)
-        work = state["work"]
-        video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
-        if not video_path.is_file() or video_path.stat().st_size == 0:
-            return JSONResponse({"error": "no encoded video was uploaded for this session"}, status_code=400)
 
-        # Resolve the audio BEFORE consuming the session. A mix the server
-        # cannot fetch (no configured origin, a 404, an auth wall, or any
-        # redirect now refused) leaves the session intact so the browser can
-        # upload the audio and ask again, instead of losing a full render at
-        # the last step.
-        # `dict.get(key, default)` only falls back when the key is ABSENT, and
-        # the browser always sends `audio_url` -- as null when it has already
-        # uploaded the mix or wants the session's stored path. So an explicit
-        # null means "no opinion", not "no audio".
-        audio_url = data.get("audio_url") or state["audio_url"]
-        origin = state["origin"]
-        if not audio_path.is_file():
-            relative = _same_host_path(audio_url) if audio_url is not None else None
-            if audio_url is not None and origin is not None and relative is None:
-                return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
-            if relative is None or origin is None:
-                return JSONResponse({"error": "no song audio was recorded for this session",
-                                     "audio_required": True}, status_code=409)
+        # Hold the session's lifecycle lock for the whole mux. It is the single
+        # mux owner: a second concurrent mux waits here, then finds the session
+        # consumed and gets a 404 instead of racing the first for the same work
+        # dir. Waiting also means any upload still in flight finishes first, so
+        # FFmpeg only ever reads finalized media, and cancel/eviction cannot
+        # delete the files while FFmpeg or the audio fetch is using them.
+        async with state["lock"]:
+            if sessions.get(session_id) is not state:
+                return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
+            work = state["work"]
+            video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
+            if not video_path.is_file() or video_path.stat().st_size == 0:
+                return JSONResponse({"error": "no encoded video was uploaded for this session"}, status_code=400)
+
+            # Resolve the audio BEFORE consuming the session. A mix the server
+            # cannot fetch (no configured origin, a 404, an auth wall, or any
+            # redirect now refused) leaves the session intact so the browser can
+            # upload the audio and ask again, instead of losing a full render at
+            # the last step.
+            # `dict.get(key, default)` only falls back when the key is ABSENT,
+            # and the browser always sends `audio_url` -- as null when it has
+            # already uploaded the mix or wants the session's stored path. So an
+            # explicit null means "no opinion", not "no audio".
+            audio_url = data.get("audio_url") or state["audio_url"]
+            origin = state["origin"]
+            if not audio_path.is_file():
+                relative = _same_host_path(audio_url) if audio_url is not None else None
+                if audio_url is not None and origin is not None and relative is None:
+                    return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
+                if relative is None or origin is None:
+                    return JSONResponse({"error": "no song audio was recorded for this session",
+                                         "audio_required": True}, status_code=409)
+                try:
+                    await _fetch_host_audio(origin, relative, audio_path)
+                except (OSError, ValueError, urllib.error.URLError) as exc:
+                    audio_path.unlink(missing_ok=True)
+                    log.warning("%s: could not fetch song audio, asking the browser to upload it: %s", PLUGIN_ID, exc)
+                    return JSONResponse({"error": str(exc), "audio_required": True}, status_code=409)
+
+            # Past this point the session is consumed: every exit path below
+            # removes its temporary directory, and a mux must not be repeatable.
+            sessions.pop(session_id, None)
             try:
-                await _fetch_host_audio(origin, relative, audio_path)
-            except (OSError, ValueError, urllib.error.URLError) as exc:
-                audio_path.unlink(missing_ok=True)
-                log.warning("%s: could not fetch song audio, asking the browser to upload it: %s", PLUGIN_ID, exc)
-                return JSONResponse({"error": str(exc), "audio_required": True}, status_code=409)
-
-        # Past this point the session is consumed: every exit path below removes
-        # its temporary directory, and a mux must not be repeatable.
-        sessions.pop(session_id, None)
-        try:
-            proc = await asyncio.to_thread(
-                _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
-            )
-            if proc.returncode != 0 or not output_path.is_file():
-                detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
-                log.error("%s: mux failed: %s", PLUGIN_ID, detail)
+                proc = await asyncio.to_thread(
+                    _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
+                )
+                if proc.returncode != 0 or not output_path.is_file():
+                    detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
+                    log.error("%s: mux failed: %s", PLUGIN_ID, detail)
+                    shutil.rmtree(work, ignore_errors=True)
+                    return JSONResponse({"error": detail}, status_code=500)
+            except (OSError, ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
                 shutil.rmtree(work, ignore_errors=True)
-                return JSONResponse({"error": detail}, status_code=500)
-        except (OSError, ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
-            shutil.rmtree(work, ignore_errors=True)
-            return JSONResponse({"error": str(exc)}, status_code=400)
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except BaseException:
+                # The session is already popped, so a disconnect or task
+                # cancellation here has nowhere else to reclaim the work dir
+                # from; the FileResponse background task is only registered on
+                # success. Clean up on any unsuccessful exit, then re-raise so
+                # cancellation still propagates.
+                shutil.rmtree(work, ignore_errors=True)
+                raise
 
-        safe_name = _safe_filename(data.get("filename")) or "feedback-export"
-        background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
-        return FileResponse(output_path, media_type="video/mp4", filename=safe_name + ".mp4",
-                            background=background_tasks)
+            safe_name = _safe_filename(data.get("filename")) or "feedback-export"
+            background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
+            return FileResponse(output_path, media_type="video/mp4", filename=safe_name + ".mp4",
+                                background=background_tasks)
 
     @app.delete(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}")
     async def cancel_session(session_id: str) -> JSONResponse:
         if session_id not in sessions:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
-        _drop_session(session_id)
+        # Waits for any in-flight upload/mux to release the session's lifecycle
+        # lock before the work dir is removed.
+        await _drop_session(session_id)
         return JSONResponse({"status": "cancelled"})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/mux")

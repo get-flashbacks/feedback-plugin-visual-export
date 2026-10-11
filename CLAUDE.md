@@ -97,11 +97,12 @@ it is the whole reason runs are cut: a live canvas must be composited between
 the static pixels above and below it.
 
 **Layer bounds are snapshot-based, under the lock.** `video_bytes` is the
-file's size, so it may only be read *inside* `append_lock`. Snapshotting before
-the acquire gives every in-flight append the same stale base, each gets a full
-`MAX_VIDEO_BYTES` of headroom, and a rollback can truncate below the accepted
-prefix. A rejected append truncates back to that snapshot — never unlink, or a
-single over-limit chunk destroys the whole render.
+file's size, so it may only be read *inside* the session's lifecycle lock
+(`state["lock"]`). Snapshotting before the acquire gives every in-flight append
+the same stale base, each gets a full `MAX_VIDEO_BYTES` of headroom, and a
+rollback can truncate below the accepted prefix. A rejected append truncates
+back to that snapshot — never unlink, or a single over-limit chunk destroys the
+whole render.
 
 **Fixed: Staff View (alphaTab) notation no longer goes stale.** Staff View
 renders sheet music as `<svg>`, swapped out by alphaTab as playback scrolls to
@@ -140,6 +141,18 @@ misses `ClientDisconnect` (a client that drops mid-stream) and `CancelledError`
 (a cancelled task), so the cleanup catches `BaseException` and re-raises — that
 re-raise is what keeps cancellation working, don't swallow it to return a
 response.
+
+**Every operation on a session's work dir takes that session's single lifecycle
+lock** (`state["lock"]`), so ownership of the temp dir is unambiguous. Video and
+audio uploads hold it for their whole stream, mux holds it across audio
+resolution and the FFmpeg run, and cancel plus the TTL/size sweep take it before
+deleting. That is what makes mux wait for in-flight uploads (FFmpeg only reads
+finalized media), admits a single mux owner, and stops cleanup from deleting
+files an operation still has open; the sweep skips a locked session rather than
+block. A waiter re-checks `sessions.get(session_id) is state` under the lock, so
+an operation that lost the race against a consume/evict returns 404 instead of
+acting on a stale reference. Don't narrow this back to a video-append-only lock
+— that is exactly how mux came to read a half-written stream.
 
 **Server-side audio resolution is opt-in and origin-pinned.** The browser only
 ever sends a site-relative `audio_url`, but that constrains the path, not the
