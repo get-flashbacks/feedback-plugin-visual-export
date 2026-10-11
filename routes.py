@@ -332,11 +332,16 @@ def setup(app: FastAPI, context: dict) -> None:
                                 raise ValueError("encoded video is too large")
                             target.write(chunk)
                     state["video_bytes"] = start + total
-                except (OSError, ValueError):
-                    # Roll back inside the lock. Doing it after release would
-                    # let a concurrent append land between the write and the
-                    # truncate, and this rollback would then discard an accepted
-                    # chunk and un-bind the cap.
+                except BaseException:
+                    # Roll back inside the lock on every unsuccessful exit, not
+                    # just OSError/ValueError: a client disconnect
+                    # (ClientDisconnect) or task cancellation (CancelledError)
+                    # bypasses a narrower handler and would otherwise leave
+                    # partial bytes in the elementary stream. Re-raising keeps
+                    # cancellation semantics intact. Doing it after release
+                    # would let a concurrent append land between the write and
+                    # the truncate, and this rollback would then discard an
+                    # accepted chunk and un-bind the cap.
                     state["video_bytes"] = start
                     if total:
                         try:
@@ -373,6 +378,13 @@ def setup(app: FastAPI, context: dict) -> None:
         except (OSError, ValueError) as exc:
             audio_path.unlink(missing_ok=True)
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except BaseException:
+            # A client disconnect or task cancellation bypasses the handler
+            # above. Remove the incomplete mix on every unsuccessful exit so a
+            # retry is not refused with 409 for a file that was never finished,
+            # then re-raise to preserve cancellation.
+            audio_path.unlink(missing_ok=True)
+            raise
         return JSONResponse({"bytes": total})
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/mux")

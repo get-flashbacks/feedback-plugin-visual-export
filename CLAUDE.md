@@ -132,7 +132,14 @@ Encoded chunks go to a server-side export session (`/sessions`, streamed to
 `/sessions/{id}/video`) when those routes exist; the browser falls back to
 buffering everything and POSTing `/mux` when the host predates them or the
 audio source needs uploading. Session temp dirs are cleaned on cancel, on mux,
-and by a TTL sweep — keep all three paths.
+and by a TTL sweep — keep all three paths. Session uploads roll back on *every*
+unsuccessful stream exit, not just `OSError`/`ValueError`: the video append
+truncates `frames.h264` back to the accepted prefix and restores the byte
+counter, and the audio upload removes the incomplete mix. A narrower handler
+misses `ClientDisconnect` (a client that drops mid-stream) and `CancelledError`
+(a cancelled task), so the cleanup catches `BaseException` and re-raises — that
+re-raise is what keeps cancellation working, don't swallow it to return a
+response.
 
 **Server-side audio resolution is opt-in and origin-pinned.** The browser only
 ever sends a site-relative `audio_url`, but that constrains the path, not the

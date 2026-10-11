@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "routes.py"
@@ -84,6 +85,17 @@ def _client(tmp_path):
     app = FastAPI()
     routes.setup(app, {"config_dir": tmp_path})
     return TestClient(app)
+
+
+def _endpoint(app, path, method):
+    for route in app.routes:
+        if getattr(route, "path", None) == path and method in (route.methods or set()):
+            return route.endpoint
+    raise AssertionError(f"no {method} route for {path}")
+
+
+VIDEO_END = "/api/plugins/visual_export/sessions/{session_id}/video"
+AUDIO_END = "/api/plugins/visual_export/sessions/{session_id}/audio"
 
 
 def _isolated_work(tmp_path, monkeypatch):
@@ -369,6 +381,136 @@ def test_rejected_append_keeps_earlier_chunks_and_the_cap(tmp_path, monkeypatch)
     assert client.post(
         f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
     ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_disconnected_video_stream_rolls_back_to_accepted_prefix(tmp_path, monkeypatch):
+    """The accepted prefix of frames.h264 survives when the client drops mid-append.
+
+    A stream cancel is a starlette ClientDisconnect, not an OSError/ValueError,
+    so it used to bypass the rollback: the uncompressed bytes stayed in the
+    elementary stream while video_bytes stayed at its pre-request snapshot,
+    letting a retry corrupt the stream and un-bind the cap.
+    """
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 10)
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    url = f"/api/plugins/visual_export/sessions/{session}/video"
+    assert client.post(url, content=b"abcde").status_code == 200
+
+    async def interrupted_stream():
+        yield b"zzz"
+        raise ClientDisconnect()
+
+    with pytest.raises(ClientDisconnect):
+        await _endpoint(client.app, VIDEO_END, "POST")(session, SimpleNamespace(stream=interrupted_stream))
+
+    # The partial bytes are gone and the counter is back to the file's size: a
+    # 5-byte append fits only if the snapshot was truly restored.
+    assert (work / "frames.h264").read_bytes() == b"abcde"
+    assert client.post(url, content=b"fghij").status_code == 200
+    assert (work / "frames.h264").read_bytes() == b"abcdefghij"
+    assert client.post(url, content=b"x").status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cancelled_video_stream_rolls_back_and_preserves_cancellation(tmp_path, monkeypatch):
+    """Task cancellation restores the prefix and still propagates."""
+    import asyncio
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "MAX_VIDEO_BYTES", 10)
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    client = _client(tmp_path)
+    session = _session(client, audio_url="/songs/pack/full_mix.wav").json()["session"]
+    url = f"/api/plugins/visual_export/sessions/{session}/video"
+    assert client.post(url, content=b"abcde").status_code == 200
+
+    first_chunk_written = asyncio.Event()
+
+    async def stuck_stream():
+        yield b"zzz"
+        await asyncio.sleep(0)
+        first_chunk_written.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        _endpoint(client.app, VIDEO_END, "POST")(session, SimpleNamespace(stream=stuck_stream))
+    )
+    await first_chunk_written.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert (work / "frames.h264").read_bytes() == b"abcde"
+    assert client.post(url, content=b"fghij").status_code == 200
+    assert (work / "frames.h264").read_bytes() == b"abcdefghij"
+
+
+@pytest.mark.asyncio
+async def test_disconnected_audio_stream_is_removed_and_retry_succeeds(tmp_path, monkeypatch):
+    """A half-uploaded mix must not leave a 409 in the client's way."""
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"audio")
+    client = _client(tmp_path)
+    session = _session(client).json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    url = f"/api/plugins/visual_export/sessions/{session}/audio"
+
+    async def interrupted_stream():
+        yield b"partial"
+        raise ClientDisconnect()
+
+    with pytest.raises(ClientDisconnect):
+        await _endpoint(client.app, AUDIO_END, "POST")(session, SimpleNamespace(stream=interrupted_stream))
+
+    assert not (work / "audio.bin").exists()
+    assert client.post(url, content=b"audio").status_code == 200
+    assert (work / "audio.bin").read_bytes() == b"audio"
+    assert client.post(
+        f"/api/plugins/visual_export/sessions/{session}/mux", json={"fps": 30, "duration": 1.0}
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelled_audio_stream_is_removed_and_retry_succeeds(tmp_path, monkeypatch):
+    """Task cancellation also discards the incomplete upload."""
+    import asyncio
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_ffmpeg(monkeypatch, work, video=b"video", audio=b"audio")
+    client = _client(tmp_path)
+    session = _session(client).json()["session"]
+    client.post(f"/api/plugins/visual_export/sessions/{session}/video", content=b"video")
+    url = f"/api/plugins/visual_export/sessions/{session}/audio"
+
+    first_chunk_written = asyncio.Event()
+
+    async def stuck_stream():
+        yield b"partial"
+        await asyncio.sleep(0)
+        first_chunk_written.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        _endpoint(client.app, AUDIO_END, "POST")(session, SimpleNamespace(stream=stuck_stream))
+    )
+    await first_chunk_written.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not (work / "audio.bin").exists()
+    assert client.post(url, content=b"audio").status_code == 200
+    assert (work / "audio.bin").read_bytes() == b"audio"
 
 
 def test_audio_fetch_requires_a_configured_origin(tmp_path, monkeypatch):

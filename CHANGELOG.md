@@ -74,6 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An interrupted session upload no longer leaves partial bytes behind.** A
+  client disconnect (`ClientDisconnect`) or a cancelled task
+  (`CancelledError`) bypassed the `OSError`/`ValueError` handlers, so a
+  half-streamed chunk stayed appended to `frames.h264` while the session's
+  byte counter still reported its pre-request value — a retry could then
+  corrupt the elementary stream and the cap no longer matched disk contents.
+  Both the video append and the audio upload now roll back on every
+  unsuccessful exit: the video is truncated to the accepted prefix and its
+  counter restored, and the incomplete mix is removed so a retry is not
+  refused with `409`. Cancellation is re-raised after cleanup.
 - **A partial Split Screen offline-render bridge is reported as a version
   problem instead of a generic render failure.** The bridge calls were
   individually optional-chained, so a Split Screen build providing
