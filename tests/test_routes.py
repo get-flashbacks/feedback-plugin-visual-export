@@ -889,3 +889,327 @@ def test_session_limit_drops_the_oldest_session(tmp_path, monkeypatch):
     assert not (work / "work0").exists()
     assert (work / "work1").exists()
     assert (work / "work2").exists()
+
+
+SESSIONS_END = "/api/plugins/visual_export/sessions"
+
+
+def _async_client(tmp_path):
+    import httpx
+
+    app = FastAPI()
+    routes.setup(app, {"config_dir": tmp_path})
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
+
+
+@pytest.mark.asyncio
+async def test_mux_waits_for_an_in_flight_upload_before_running_ffmpeg(tmp_path, monkeypatch):
+    """FFmpeg must not read a stream that is still being appended.
+
+    A video append holds the session lifecycle lock for its whole body, so a
+    concurrent mux blocks on it and only then sees the finalized media. Before
+    the lock was shared, mux ignored the append in progress, invoked FFmpeg on
+    the partial elementary stream, and consumed the session out from under the
+    still-running upload.
+    """
+    import asyncio
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    _stub_audio(monkeypatch)
+
+    seen = []
+
+    def fake_ffmpeg(cmd, **kwargs):
+        seen.append((work / "frames.h264").read_bytes())
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_ffmpeg)
+
+    first_chunk = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_body():
+        yield b"firsthalf"
+        first_chunk.set()
+        await release.wait()
+        yield b"secondhalf"
+
+    async with _async_client(tmp_path) as client:
+        session = (
+            await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0, "audio_url": "/songs/pack/full_mix.wav"})
+        ).json()["session"]
+        upload = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/video", content=blocked_body())
+        )
+        await first_chunk.wait()
+        mux = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/mux", json={"fps": 30, "duration": 1.0})
+        )
+        # The mux is parked on the lifecycle lock: give it a real chance to run
+        # before asserting it has not reached FFmpeg.
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert seen == []
+
+        release.set()
+        upload_response = await upload
+        mux_response = await mux
+
+    assert upload_response.status_code == 200
+    assert mux_response.status_code == 200
+    # FFmpeg saw both halves, not just the chunk that was flushed pre-release.
+    assert seen == [b"firsthalfsecondhalf"]
+
+
+@pytest.mark.asyncio
+async def test_mux_waits_for_an_in_flight_audio_upload(tmp_path, monkeypatch):
+    """A half-written audio.bin must not be muxed as if it were complete.
+
+    The audio upload holds the lifecycle lock while it streams, so a mux waits
+    for it instead of treating the file's mere existence as a finished mix.
+    """
+    import asyncio
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+
+    seen = []
+
+    def fake_ffmpeg(cmd, **kwargs):
+        seen.append((work / "audio.bin").read_bytes())
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_ffmpeg)
+
+    first_chunk = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_body():
+        yield b"firsthalf"
+        first_chunk.set()
+        await release.wait()
+        yield b"secondhalf"
+
+    async with _async_client(tmp_path) as client:
+        session = (await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})).json()["session"]
+        await client.post(f"{SESSIONS_END}/{session}/video", content=b"video")
+        upload = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/audio", content=blocked_body())
+        )
+        await first_chunk.wait()
+        mux = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/mux", json={"fps": 30, "duration": 1.0})
+        )
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert seen == []
+
+        release.set()
+        upload_response = await upload
+        mux_response = await mux
+
+    assert upload_response.status_code == 200
+    assert mux_response.status_code == 200
+    # FFmpeg saw the whole mix, not the first half that existed pre-release.
+    assert seen == [b"firsthalfsecondhalf"]
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_muxes_consume_the_session_once(tmp_path, monkeypatch):
+    """A session admits a single mux owner even while resolving host audio.
+
+    Audio is resolved before the session is popped, so two overlapping muxes
+    could both pass that point and each run FFmpeg on the same work dir. The
+    lifecycle lock serializes them: the first consumes the session, the second
+    then finds it gone and gets a 404.
+    """
+    import asyncio
+    import threading
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+    monkeypatch.setenv("FEEDBACK_PUBLIC_ORIGIN", "http://feedback.test")
+
+    release = threading.Event()
+    started = threading.Event()
+
+    class _BlockingOpener:
+        def open(self, request, timeout=None):
+            started.set()
+            release.wait(5)
+
+            class _Response(io.BytesIO):
+                def __init__(self):
+                    super().__init__(b"audio")
+                    self._url = str(request.full_url)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self.close()
+                    return False
+
+                def geturl(self):
+                    return self._url
+
+            return _Response()
+
+    monkeypatch.setattr(routes, "_AUDIO_OPENER", _BlockingOpener())
+
+    ffmpeg_calls = []
+
+    def fake_ffmpeg(cmd, **kwargs):
+        ffmpeg_calls.append(1)
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_ffmpeg)
+
+    async with _async_client(tmp_path) as client:
+        session = (
+            await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0, "audio_url": "/songs/pack/full_mix.wav"})
+        ).json()["session"]
+        await client.post(f"{SESSIONS_END}/{session}/video", content=b"video")
+        mux_url = f"{SESSIONS_END}/{session}/mux"
+        first = asyncio.create_task(client.post(mux_url, json={"fps": 30, "duration": 1.0}))
+        await asyncio.to_thread(started.wait, 5)
+        second = asyncio.create_task(client.post(mux_url, json={"fps": 30, "duration": 1.0}))
+        # Let the second mux reach the lock while the first is mid-fetch.
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert ffmpeg_calls == []
+        release.set()
+        responses = [await first, await second]
+
+    assert len(ffmpeg_calls) == 1
+    assert sorted(r.status_code for r in responses) == [200, 404]
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_an_active_upload_before_removing_the_work_dir(tmp_path, monkeypatch):
+    """Cancelling mid-upload must not delete files the upload is still writing.
+
+    The append holds the lifecycle lock, so cancel blocks until it finishes and
+    only then removes the work dir, instead of pulling frames.h264 out from
+    under the writer.
+    """
+    import asyncio
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+
+    first_chunk = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_body():
+        yield b"half"
+        first_chunk.set()
+        await release.wait()
+        yield b"rest"
+
+    async with _async_client(tmp_path) as client:
+        session = (await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})).json()["session"]
+        upload = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/video", content=blocked_body())
+        )
+        await first_chunk.wait()
+        cancel = asyncio.create_task(client.delete(f"{SESSIONS_END}/{session}"))
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert not cancel.done()
+        assert work.exists()
+
+        release.set()
+        upload_response = await upload
+        cancel_response = await cancel
+
+    assert upload_response.status_code == 200
+    assert cancel_response.status_code == 200
+    assert not work.exists()
+
+
+@pytest.mark.asyncio
+async def test_eviction_skips_a_session_mid_operation(tmp_path, monkeypatch):
+    """A sweep must not expire a session whose files an operation is using."""
+    import asyncio
+
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes, "SESSION_TTL_SECONDS", 0)
+    _isolated_work(tmp_path, monkeypatch)
+
+    first_chunk = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_body():
+        yield b"half"
+        first_chunk.set()
+        await release.wait()
+        yield b"rest"
+
+    async with _async_client(tmp_path) as client:
+        session = (await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})).json()["session"]
+        first_work = tmp_path / "work1"
+        upload = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/video", content=blocked_body())
+        )
+        await first_chunk.wait()
+        # Creating another session sweeps expired ones; the in-flight session is
+        # locked, so it must be skipped rather than deleted mid-append.
+        await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})
+        assert first_work.exists()
+
+        release.set()
+        await upload
+        # Idle now, the next sweep collects it.
+        await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})
+        assert not first_work.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mux_removes_the_work_dir(tmp_path, monkeypatch):
+    """A mux cancelled mid-FFmpeg must not leak the consumed session's files.
+
+    The session is popped before FFmpeg runs, so a cancellation there has no
+    other cleanup path — the response's background removal is only registered
+    on success.
+    """
+    import asyncio
+    import threading
+
+    work = tmp_path / "work"
+    monkeypatch.setattr(routes, "_ffmpeg_cmd", lambda: "ffmpeg")
+    monkeypatch.setattr(routes.tempfile, "mkdtemp", lambda **kwargs: str(work.mkdir() or work))
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def stuck_ffmpeg(cmd, **kwargs):
+        entered.set()
+        release.wait(5)
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", stuck_ffmpeg)
+
+    async with _async_client(tmp_path) as client:
+        session = (await client.post(SESSIONS_END, json={"fps": 30, "duration": 1.0})).json()["session"]
+        await client.post(f"{SESSIONS_END}/{session}/video", content=b"video")
+        await client.post(f"{SESSIONS_END}/{session}/audio", content=b"audio")
+        task = asyncio.create_task(
+            client.post(f"{SESSIONS_END}/{session}/mux", json={"fps": 30, "duration": 1.0})
+        )
+        await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    release.set()
+    assert not work.exists()

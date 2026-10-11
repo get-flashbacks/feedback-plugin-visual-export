@@ -15,9 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export sessions let the browser stream encoded H.264 chunks to the server as
   they are produced instead of keeping the whole elementary stream in memory.
   The session's total encoded bytes stay capped by the existing 2 GB limit
-  across all appends, including appends that overlap. Cancelling an export still
-  deletes the session immediately, and abandoned sessions are expired
-  server-side.
+  across all appends, including appends that overlap. Cancelling an export
+  deletes the session, and abandoned sessions are expired server-side; both wait
+  for any upload or mux still using the session to finish before its files are
+  removed.
 - Set `FEEDBACK_PUBLIC_ORIGIN` (for example `http://127.0.0.1:5173`) to let the
   server fetch a same-host song mix itself, so the browser no longer downloads
   and re-uploads it. The server tells the browser whether it can resolve the
@@ -74,6 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Export session operations are serialized on one lifecycle lock.** The
+  previous `append_lock` only protected concurrent video appends: a mux could
+  run while an upload was still streaming, so FFmpeg read an incomplete
+  elementary stream, and the session could be consumed (and its work dir
+  removed) before the upload finished. Two overlapping mux requests could also
+  both pass the audio-resolution step that runs before the session is popped.
+  Every operation that touches a session's work dir — video and audio uploads,
+  mux, cancel, and the TTL/size sweep — now takes the session's lifecycle
+  lock: mux waits for in-flight uploads so FFmpeg only ever reads finalized
+  media, only a single mux can own a session, and cancel/eviction wait for or
+  skip a session in use instead of deleting files underneath it.
 - **An interrupted session upload no longer leaves partial bytes behind.** A
   client disconnect (`ClientDisconnect`) or a cancelled task
   (`CancelledError`) bypassed the `OSError`/`ValueError` handlers, so a
