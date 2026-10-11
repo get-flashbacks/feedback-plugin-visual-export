@@ -159,28 +159,46 @@ def _expected_origin() -> str | None:
 
 
 def setup(app: FastAPI, context: dict) -> None:
-    config_dir = Path(context["config_dir"])
-    log = context.get("log") or logging.getLogger(f"feedBack.plugin.{PLUGIN_ID}")
-    config_file = config_dir / f"{PLUGIN_ID}.json"
+    _ExportRoutes(app, context)
 
-    def _read() -> dict:
+
+class _ExportRoutes:
+    """Route handlers and export sessions isolated to one host application."""
+
+    def __init__(self, app: FastAPI, context: dict) -> None:
+        self.config_dir = Path(context["config_dir"])
+        self.log = context.get("log") or logging.getLogger(f"feedBack.plugin.{PLUGIN_ID}")
+        self.config_file = self.config_dir / f"{PLUGIN_ID}.json"
+        # H.264 chunks stream into per-app sessions; /mux remains the fallback
+        # for hosts or audio sources that cannot use streaming sessions.
+        self.sessions: dict[str, dict] = {}
+        app.get(f"/api/plugins/{PLUGIN_ID}/settings")(self.get_settings)
+        app.post(f"/api/plugins/{PLUGIN_ID}/settings")(self.set_settings)
+        app.get(f"/api/plugins/{PLUGIN_ID}/capabilities")(self.capabilities)
+        app.post(f"/api/plugins/{PLUGIN_ID}/sessions")(self.create_session)
+        app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/video")(self.append_session_video)
+        app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/audio")(self.upload_session_audio)
+        app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/mux")(self.mux_session)
+        app.delete(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}")(self.cancel_session)
+        app.post(f"/api/plugins/{PLUGIN_ID}/mux")(self.mux_export)
+        self.log.info("%s: routes registered", PLUGIN_ID)
+
+    def _read(self) -> dict:
         settings = dict(_DEFAULTS)
         try:
-            data = json.loads(config_file.read_text(encoding="utf-8"))
+            data = json.loads(self.config_file.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 settings.update({k: v for k, v in data.items() if _is_valid_setting(k, v)})
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as exc:
-            log.warning("%s: unreadable config, using defaults: %s", PLUGIN_ID, exc)
+            self.log.warning("%s: unreadable config, using defaults: %s", PLUGIN_ID, exc)
         return settings
 
-    @app.get(f"/api/plugins/{PLUGIN_ID}/settings")
-    def get_settings() -> JSONResponse:
-        return JSONResponse(_read())
+    def get_settings(self) -> JSONResponse:
+        return JSONResponse(self._read())
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/settings")
-    async def set_settings(request: Request) -> JSONResponse:
+    async def set_settings(self, request: Request) -> JSONResponse:
         raw = await request.body()
         if len(raw) > MAX_SETTINGS_BODY_BYTES:
             return JSONResponse({"error": "request body too large"}, status_code=413)
@@ -192,30 +210,21 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": "unknown settings"}, status_code=400)
         if not all(_is_valid_setting(k, v) for k, v in incoming.items()):
             return JSONResponse({"error": "invalid setting values"}, status_code=400)
-        merged = {**_read(), **incoming}
+        merged = {**self._read(), **incoming}
         try:
-            config_dir.mkdir(parents=True, exist_ok=True)
+            self.config_dir.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(
-                config_file.write_text, json.dumps(merged, indent=2), encoding="utf-8"
+                self.config_file.write_text, json.dumps(merged, indent=2), encoding="utf-8"
             )
         except OSError as exc:
-            log.error("%s: failed to save settings: %s", PLUGIN_ID, exc)
+            self.log.error("%s: failed to save settings: %s", PLUGIN_ID, exc)
             return JSONResponse({"error": "failed to save settings"}, status_code=500)
         return JSONResponse(merged)
 
-    @app.get(f"/api/plugins/{PLUGIN_ID}/capabilities")
-    def capabilities() -> JSONResponse:
+    def capabilities(self) -> JSONResponse:
         return JSONResponse({"ffmpeg": bool(_ffmpeg_cmd()), "format": "mp4", "sessions": True})
 
-    # Issue #9, phase 3: streaming export sessions. The browser posts encoded
-    # H.264 chunks as the encoder produces them, so the complete elementary
-    # stream is never held in browser memory, and the server resolves the
-    # song mix from its own host instead of receiving an uploaded copy. The
-    # single-request /mux route below stays available and unchanged as the
-    # fallback for hosts or sources that cannot use a session.
-    sessions: dict[str, dict] = {}
-
-    async def _drop_session(session_id: str) -> None:
+    async def _drop_session(self, session_id: str) -> None:
         """Retire a session and delete its work files under its lifecycle lock.
 
         Every operation that touches a session's work dir holds that session's
@@ -224,18 +233,18 @@ def setup(app: FastAPI, context: dict) -> None:
         fetch. The membership re-check matters because a caller may have read
         the session before an earlier operation consumed it while we waited.
         """
-        state = sessions.get(session_id)
+        state = self.sessions.get(session_id)
         if state is None:
             return
         async with state["lock"]:
-            if sessions.get(session_id) is not state:
+            if self.sessions.get(session_id) is not state:
                 return
-            sessions.pop(session_id, None)
+            self.sessions.pop(session_id, None)
             shutil.rmtree(state["work"], ignore_errors=True)
 
-    async def _sweep_sessions() -> None:
+    async def _sweep_sessions(self) -> None:
         now = time.monotonic()
-        for session_id, state in list(sessions.items()):
+        for session_id, state in list(self.sessions.items()):
             # A locked session has an operation in flight, so its files are in
             # use: skip it rather than delete underneath it. It stays a
             # candidate for the next sweep, once it has gone idle. A client that
@@ -246,19 +255,19 @@ def setup(app: FastAPI, context: dict) -> None:
             if state["lock"].locked():
                 continue
             if now - state["touched"] > SESSION_TTL_SECONDS:
-                log.info("%s: expiring abandoned export session %s", PLUGIN_ID, session_id)
-                await _drop_session(session_id)
+                self.log.info("%s: expiring abandoned export session %s", PLUGIN_ID, session_id)
+                await self._drop_session(session_id)
         # Best-effort cap: it can only evict idle sessions, so a burst of
         # simultaneously locked sessions can briefly exceed MAX_SESSIONS until
         # they go idle and the next create sweeps them.
-        while len(sessions) >= MAX_SESSIONS:
-            idle = [key for key, state in sessions.items() if not state["lock"].locked()]
+        while len(self.sessions) >= MAX_SESSIONS:
+            idle = [key for key, state in self.sessions.items() if not state["lock"].locked()]
             if not idle:
                 break
-            oldest = min(idle, key=lambda key: sessions[key]["touched"])
-            await _drop_session(oldest)
+            oldest = min(idle, key=lambda key: self.sessions[key]["touched"])
+            await self._drop_session(oldest)
 
-    async def _json_body(request: Request) -> dict | None:
+    async def _json_body(self, request: Request) -> dict | None:
         raw = await request.body()
         if len(raw) > MAX_SESSION_BODY_BYTES:
             return None
@@ -268,7 +277,7 @@ def setup(app: FastAPI, context: dict) -> None:
             return None
         return data if isinstance(data, dict) else None
 
-    async def _fetch_host_audio(origin: str, relative: str, target: Path) -> None:
+    async def _fetch_host_audio(self, origin: str, relative: str, target: Path) -> None:
         """Download `relative` from `origin` without ever leaving that origin.
 
         Redirects are refused rather than followed: validating the *path* only
@@ -299,12 +308,11 @@ def setup(app: FastAPI, context: dict) -> None:
 
         await asyncio.to_thread(_download)
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions")
-    async def create_session(request: Request) -> JSONResponse:
+    async def create_session(self, request: Request) -> JSONResponse:
         ffmpeg = _ffmpeg_cmd()
         if not ffmpeg:
             return JSONResponse({"error": "FFmpeg is not installed"}, status_code=503)
-        data = await _json_body(request)
+        data = await self._json_body(request)
         if data is None:
             return JSONResponse({"error": "invalid session request"}, status_code=400)
         if not _valid_timing(data.get("fps"), data.get("duration")):
@@ -312,9 +320,9 @@ def setup(app: FastAPI, context: dict) -> None:
         audio_url = data.get("audio_url")
         if audio_url is not None and _same_host_path(audio_url) is None:
             return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
-        await _sweep_sessions()
+        await self._sweep_sessions()
         session_id = uuid.uuid4().hex
-        sessions[session_id] = {
+        self.sessions[session_id] = {
             "work": Path(tempfile.mkdtemp(prefix="feedback-visual-export-")),
             "touched": time.monotonic(),
             "origin": _expected_origin(),
@@ -333,11 +341,10 @@ def setup(app: FastAPI, context: dict) -> None:
         return JSONResponse({"session": session_id,
                              # Only true when this session can actually resolve a
                              # mix: both a configured origin and a path to use.
-                             "audio_fetch": bool(sessions[session_id]["origin"] and audio_url)})
+                             "audio_fetch": bool(self.sessions[session_id]["origin"] and audio_url)})
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/video")
-    async def append_session_video(session_id: str, request: Request) -> JSONResponse:
-        state = sessions.get(session_id)
+    async def append_session_video(self, session_id: str, request: Request) -> JSONResponse:
+        state = self.sessions.get(session_id)
         if state is None:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
         state["touched"] = time.monotonic()
@@ -351,7 +358,7 @@ def setup(app: FastAPI, context: dict) -> None:
             async with state["lock"]:
                 # Re-check under the lock: the session may have been consumed or
                 # evicted while this request waited for it.
-                if sessions.get(session_id) is not state:
+                if self.sessions.get(session_id) is not state:
                     return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
                 # Snapshot under the lock. Reading it before would let every
                 # in-flight append take the same pre-lock base, so each would
@@ -396,9 +403,8 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"bytes": total})
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/audio")
-    async def upload_session_audio(session_id: str, request: Request) -> JSONResponse:
-        state = sessions.get(session_id)
+    async def upload_session_audio(self, session_id: str, request: Request) -> JSONResponse:
+        state = self.sessions.get(session_id)
         if state is None:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
         state["touched"] = time.monotonic()
@@ -406,7 +412,7 @@ def setup(app: FastAPI, context: dict) -> None:
         total = 0
         try:
             async with state["lock"]:
-                if sessions.get(session_id) is not state:
+                if self.sessions.get(session_id) is not state:
                     return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
                 # "Exists" means "fully uploaded": an in-progress upload holds
                 # the lock, so a concurrent mux or a second upload can never
@@ -435,15 +441,44 @@ def setup(app: FastAPI, context: dict) -> None:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"bytes": total})
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}/mux")
-    async def mux_session(background_tasks: BackgroundTasks, session_id: str, request: Request):
+    async def _resolve_session_audio(self, state: dict, data: dict, audio_path: Path) -> JSONResponse | None:
+        """Resolve audio under the lifecycle lock without consuming the session."""
+        # Resolve the audio BEFORE consuming the session. A mix the server
+        # cannot fetch (no configured origin, a 404, an auth wall, or any
+        # redirect now refused) leaves the session intact so the browser can
+        # upload the audio and ask again, instead of losing a full render at
+        # the last step.
+        # `dict.get(key, default)` only falls back when the key is ABSENT,
+        # and the browser always sends `audio_url` -- as null when it has
+        # already uploaded the mix or wants the session's stored path. So an
+        # explicit null means "no opinion", not "no audio".
+        audio_url = data.get("audio_url") or state["audio_url"]
+        origin = state["origin"]
+        if audio_path.is_file():
+            return None
+        relative = _same_host_path(audio_url) if audio_url is not None else None
+        if audio_url is not None and origin is not None and relative is None:
+            return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
+        if relative is None or origin is None:
+            return JSONResponse({"error": "no song audio was recorded for this session",
+                                 "audio_required": True}, status_code=409)
+        try:
+            await self._fetch_host_audio(origin, relative, audio_path)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            audio_path.unlink(missing_ok=True)
+            self.log.warning("%s: could not fetch song audio, asking the browser to upload it: %s", PLUGIN_ID, exc)
+            return JSONResponse({"error": str(exc), "audio_required": True}, status_code=409)
+
+        return None
+
+    async def mux_session(self, background_tasks: BackgroundTasks, session_id: str, request: Request):
         ffmpeg = _ffmpeg_cmd()
         if not ffmpeg:
             return JSONResponse({"error": "FFmpeg is not installed"}, status_code=503)
-        state = sessions.get(session_id)
+        state = self.sessions.get(session_id)
         if state is None:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
-        data = await _json_body(request)
+        data = await self._json_body(request)
         if data is None:
             return JSONResponse({"error": "invalid session request"}, status_code=400)
         if not _valid_timing(data.get("fps"), data.get("duration")):
@@ -456,78 +491,62 @@ def setup(app: FastAPI, context: dict) -> None:
         # FFmpeg only ever reads finalized media, and cancel/eviction cannot
         # delete the files while FFmpeg or the audio fetch is using them.
         async with state["lock"]:
-            if sessions.get(session_id) is not state:
+            if self.sessions.get(session_id) is not state:
                 return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
             work = state["work"]
-            video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
+            video_path, audio_path = work / "frames.h264", work / "audio.bin"
             if not video_path.is_file() or video_path.stat().st_size == 0:
                 return JSONResponse({"error": "no encoded video was uploaded for this session"}, status_code=400)
 
-            # Resolve the audio BEFORE consuming the session. A mix the server
-            # cannot fetch (no configured origin, a 404, an auth wall, or any
-            # redirect now refused) leaves the session intact so the browser can
-            # upload the audio and ask again, instead of losing a full render at
-            # the last step.
-            # `dict.get(key, default)` only falls back when the key is ABSENT,
-            # and the browser always sends `audio_url` -- as null when it has
-            # already uploaded the mix or wants the session's stored path. So an
-            # explicit null means "no opinion", not "no audio".
-            audio_url = data.get("audio_url") or state["audio_url"]
-            origin = state["origin"]
-            if not audio_path.is_file():
-                relative = _same_host_path(audio_url) if audio_url is not None else None
-                if audio_url is not None and origin is not None and relative is None:
-                    return JSONResponse({"error": "audio_url must be a same-host path"}, status_code=400)
-                if relative is None or origin is None:
-                    return JSONResponse({"error": "no song audio was recorded for this session",
-                                         "audio_required": True}, status_code=409)
-                try:
-                    await _fetch_host_audio(origin, relative, audio_path)
-                except (OSError, ValueError, urllib.error.URLError) as exc:
-                    audio_path.unlink(missing_ok=True)
-                    log.warning("%s: could not fetch song audio, asking the browser to upload it: %s", PLUGIN_ID, exc)
-                    return JSONResponse({"error": str(exc), "audio_required": True}, status_code=409)
+            audio_error = await self._resolve_session_audio(state, data, audio_path)
+            if audio_error is not None:
+                return audio_error
 
             # Past this point the session is consumed: every exit path below
             # removes its temporary directory, and a mux must not be repeatable.
-            sessions.pop(session_id, None)
-            try:
-                proc = await asyncio.to_thread(
-                    _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
-                )
-                if proc.returncode != 0 or not output_path.is_file():
-                    detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
-                    log.error("%s: mux failed: %s", PLUGIN_ID, detail)
-                    shutil.rmtree(work, ignore_errors=True)
-                    return JSONResponse({"error": detail}, status_code=500)
-            except (OSError, ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
-                shutil.rmtree(work, ignore_errors=True)
-                return JSONResponse({"error": str(exc)}, status_code=400)
-            except BaseException:
-                # The session is already popped, so a disconnect or task
-                # cancellation here has nowhere else to reclaim the work dir
-                # from; the FileResponse background task is only registered on
-                # success. Clean up on any unsuccessful exit, then re-raise so
-                # cancellation still propagates.
-                shutil.rmtree(work, ignore_errors=True)
-                raise
+            self.sessions.pop(session_id, None)
+            return await self._mux_session_files(background_tasks, ffmpeg, work, data)
 
-            safe_name = _safe_filename(data.get("filename")) or "feedback-export"
-            background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
-            return FileResponse(output_path, media_type="video/mp4", filename=safe_name + ".mp4",
-                                background=background_tasks)
+    async def _mux_session_files(self, background_tasks: BackgroundTasks, ffmpeg: str,
+                                 work: Path, data: dict):
+        """Mux a consumed session; remove its files on every unsuccessful exit."""
+        video_path, audio_path, output_path = work / "frames.h264", work / "audio.bin", work / "export.mp4"
+        try:
+            proc = await asyncio.to_thread(
+                _run_ffmpeg, ffmpeg, video_path, audio_path, output_path, data["fps"], float(data["duration"])
+            )
+            if proc.returncode != 0 or not output_path.is_file():
+                detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
+                self.log.error("%s: mux failed: %s", PLUGIN_ID, detail)
+                shutil.rmtree(work, ignore_errors=True)
+                return JSONResponse({"error": detail}, status_code=500)
+        except (OSError, ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except BaseException:
+            # The session is already popped, so a disconnect or task
+            # cancellation here has nowhere else to reclaim the work dir
+            # from; the FileResponse background task is only registered on
+            # success. Clean up on any unsuccessful exit, then re-raise so
+            # cancellation still propagates.
+            shutil.rmtree(work, ignore_errors=True)
+            raise
 
-    @app.delete(f"/api/plugins/{PLUGIN_ID}/sessions/{{session_id}}")
-    async def cancel_session(session_id: str) -> JSONResponse:
-        if session_id not in sessions:
+        safe_name = _safe_filename(data.get("filename")) or "feedback-export"
+        background_tasks.add_task(shutil.rmtree, work, ignore_errors=True)
+        return FileResponse(output_path, media_type="video/mp4", filename=safe_name + ".mp4",
+                            background=background_tasks)
+
+    async def cancel_session(self, session_id: str) -> JSONResponse:
+        if session_id not in self.sessions:
             return JSONResponse({"error": "unknown or expired export session"}, status_code=404)
         # Waits for any in-flight upload/mux to release the session's lifecycle
         # lock before the work dir is removed.
-        await _drop_session(session_id)
+        await self._drop_session(session_id)
         return JSONResponse({"status": "cancelled"})
 
-    @app.post(f"/api/plugins/{PLUGIN_ID}/mux")
     async def mux_export(
+        self,
         background_tasks: BackgroundTasks,
         video: UploadFile = File(...),
         audio: UploadFile = File(...),
@@ -550,7 +569,7 @@ def setup(app: FastAPI, context: dict) -> None:
             )
             if proc.returncode != 0 or not output_path.is_file():
                 detail = (proc.stderr or "FFmpeg failed").strip()[-2000:]
-                log.error("%s: mux failed: %s", PLUGIN_ID, detail)
+                self.log.error("%s: mux failed: %s", PLUGIN_ID, detail)
                 shutil.rmtree(work, ignore_errors=True)
                 return JSONResponse({"error": detail}, status_code=500)
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -565,5 +584,3 @@ def setup(app: FastAPI, context: dict) -> None:
         return FileResponse(output_path, media_type="video/mp4",
                             filename=safe_name + ".mp4",
                             background=background_tasks)
-
-    log.info("%s: routes registered", PLUGIN_ID)
